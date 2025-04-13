@@ -1,35 +1,27 @@
-/*
- * lkjsxceditor - A simple Vim-like text editor in one C file.
- *
- * Features:
- * - Normal, Insert, Command modes
- * - Basic movement (h,j,k,l, PageUp/Down, Home/End)
- * - Basic insertion and deletion (backspace, enter)
- * - Static memory allocation (fixed buffer pool)
- * - Minimal external dependencies (standard C library + POSIX termios/ioctl/fcntl)
- * - Basic commands: :w, :q, :wq, :w <filename>
- * - Minimal error handling (uses status bar)
- */
-
-#include <ctype.h>  // iscntrl, isprint
-#include <errno.h>  // errno, EAGAIN, ENOENT
-#include <fcntl.h>  // open flags
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stddef.h>  // for NULL, size_t
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>  // ioctl, TIOCGWINSZ, winsize
-#include <sys/stat.h>   // open, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC
-#include <termios.h>    // termios, tcgetattr, tcsetattr, TCSAFLUSH, ECHO, ICANON, etc.
-#include <time.h>       // time (currently unused for status timeout)
-#include <unistd.h>     // write, read, close, STDIN_FILENO, STDOUT_FILENO
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <termios.h>
+#include <time.h>
+#include <unistd.h>
 
-// --- Configuration ---
-#define BUFCHUNK_SIZE 512         // Size of each text chunk
-#define BUFCHUNK_COUNT 1024       // Number of chunks in the pool (512 KiB total)
-#define SCREEN_BUFFER_SIZE 65536  // Static buffer for screen drawing (64 KiB)
-#define COMMAND_BUFFER_MAX 100    // Max length for command mode input
+// *** Defines ***
+#define LKJSXCEDITOR_VERSION "0.0.1"
+#define BUFCHUNK_SIZE 512      // Size of each text chunk
+#define BUFCHUNK_COUNT 32768   // Number of chunks (32768 * 512 = 16MB for text)
+#define SCREEN_BUF_SIZE 65536  // Buffer for screen rendering (64KB)
+#define FILE_BUF_SIZE 4096     // Buffer for file I/O (4KB)
+#define STATUS_BUF_SIZE 128    // Buffer for status messages
+#define CMD_BUF_SIZE 128       // Max command length
+#define TAB_STOP 8
+#define QUIT_TIMES 1  // Require 1 confirmation to quit if modified
 
-// --- Enums ---
+// *** Enums ***
 enum RESULT {
     RESULT_OK,
     RESULT_ERR
@@ -41,1643 +33,1764 @@ enum editorMode {
     MODE_COMMAND
 };
 
-// Key codes for special keys (values >= 1000 to avoid conflict with ASCII)
+// Custom key codes for non-ASCII keys
 enum editorKey {
-    ARROW_LEFT = 1009,
-    ARROW_RIGHT = 1008,
-    ARROW_UP = 1006,
-    ARROW_DOWN = 1007,
-    DEL_KEY = 1003,
-    HOME_KEY = 1000,
-    END_KEY = 1001,
-    PAGE_UP = 1004,
-    PAGE_DOWN = 1005,
-    BACKSPACE = 127  // Map ASCII DEL (127) to Backspace behavior
-    // Note: Some terminals might send ^H (ASCII 8) for backspace. Handle later if needed.
+    KEY_NULL = 0,       // Null key
+    BACKSPACE = 127,    // ASCII backspace
+    ARROW_LEFT = 1000,  // Assign arbitrary codes > 255
+    ARROW_RIGHT,
+    ARROW_UP,
+    ARROW_DOWN,
+    DEL_KEY,
+    HOME_KEY,
+    END_KEY,
+    PAGE_UP,
+    PAGE_DOWN
 };
 
-// --- Data Structures ---
-
-// Represents a chunk of text in the buffer's linked list
+// *** Structs ***
 struct bufchunk {
     char data[BUFCHUNK_SIZE];
     struct bufchunk* prev;
     struct bufchunk* next;
-    int size;  // Number of bytes currently used in data[]
+    int size;  // Number of bytes used in data
 };
 
-// Represents a buffer (text, command, message) using linked chunks
 struct bufclient {
-    struct bufchunk* begin;         // First chunk in the buffer
-    struct bufchunk* rbegin;        // Last chunk in the buffer
-    struct bufchunk* cursor_chunk;  // Chunk containing the logical cursor/insertion point
-    int cursor_index;               // Index within the cursor_chunk
-    int size;                       // Total number of bytes stored across all chunks
+    struct bufchunk* begin;         // First chunk
+    struct bufchunk* rbegin;        // Last chunk (reverse begin)
+    struct bufchunk* cursor_chunk;  // Chunk where the cursor is located
+    int cursor_rel_i;               // Relative index within cursor_chunk
+    int cursor_abs_i;               // Absolute index from the start of the buffer
+    int cursor_abs_y;               // Absolute line number (0-based)
+    int cursor_abs_x;               // Calculated visual column number on the line (0-based, handles tabs)
+    int cursor_goal_x;              // Desired visual X position when moving vertically
+    int size;                       // Total size of the buffer in bytes
+    char filename[256];             // Associated filename
+    int dirty;                      // 1 if modified since last save, 0 otherwise
+    // Display offsets
+    int rowoff;  // First visible row (line number)
+    int coloff;  // First visible visual column
+    // Cache for finding start of rowoff quickly (can be NULL if invalid)
+    struct bufchunk* rowoff_chunk;  // Chunk containing the start of the first visible row
+    int rowoff_rel_i;               // Relative index within rowoff_chunk
+    int rowoff_abs_i;               // Absolute index for start of rowoff
 };
 
-// Global editor state structure
-struct editorConfig {
-    int cx, cy;                   // Screen cursor X, Y (0-based, relative to top-left of text area)
-    int rx;                       // Rendered cursor X (0-based, handling tabs, relative to line start)
-    int rowoff;                   // Row offset (which file row number (0-based) is at top of screen)
-    int coloff;                   // Column offset (which file column number (0-based) is at left of screen)
-    int screenrows;               // Number of rows available for text editing (Terminal rows - 2)
-    int screencols;               // Number of columns available (Terminal cols)
-    char filename[256];           // Current filename associated with the buffer
-    char statusmsg[80];           // Status message buffer displayed on the message bar
-    time_t statusmsg_time;        // Timestamp for status message (for timeout - currently unused)
-    struct termios orig_termios;  // Stores original terminal settings for restoration
-    enum editorMode mode;         // Current editor mode (Normal, Insert, Command)
-    struct bufclient textbuf;     // Main text buffer where the file content resides
-    struct bufclient cmdbuf;      // Buffer for typing commands in Command mode
-    int quit_flag;                // Flag set to 1 to signal the main loop to exit
-    // int modified_flag; // TODO: Add flag to track unsaved changes
-};
+// *** Global Variables ***
+static int screenrows;                     // Terminal height (text area)
+static int screencols;                     // Terminal width
+static struct termios orig_termios;        // Original terminal settings
+static volatile int terminate_editor = 0;  // Flag to signal exit from main loop
+static enum editorMode mode = MODE_NORMAL;
+static struct bufclient textbuf;   // Main text buffer
+static char cmdbuf[CMD_BUF_SIZE];  // Command line buffer
+static int cmdbuf_len = 0;
+static char statusbuf[STATUS_BUF_SIZE];  // Status message buffer
+static time_t statusbuf_time = 0;        // Timestamp for status message display
 
-// --- Globals ---
-static struct bufchunk bufchunk_pool_data[BUFCHUNK_COUNT];  // Static pool of chunks
-static struct bufchunk* bufchunk_pool_free = NULL;          // Head of the free chunk list
-static struct editorConfig E;                               // Global editor state instance
+// Buffer Chunk Pool
+static struct bufchunk bufchunk_pool_data[BUFCHUNK_COUNT];
+static struct bufchunk* bufchunk_pool_free = NULL;
+static int bufchunk_pool_used = 0;
 
-// Static buffer for accumulating screen output to minimize write() calls
-static char screen_buffer[SCREEN_BUFFER_SIZE];
-static int screen_buffer_len = 0;  // Current length of content in screen_buffer
+// Screen buffer (using a static buffer instead of dynamic abuf)
+static char screenbuf[SCREEN_BUF_SIZE];
+static int screenbuf_len = 0;
 
-// --- Buffer Chunk Pool Management ---
+// *** Function Prototypes ***
 
-// Initializes the free list for the buffer chunk pool.
+// Core Utils
+void die(const char* s);
+void editorSetStatusMessage(const char* msg);
+
+// Buffer Chunk Pool
+void bufchunk_pool_init();
+struct bufchunk* bufchunk_alloc();
+void bufchunk_free(struct bufchunk* chunk);
+
+// Buffer Client Helpers
+enum RESULT bufclient_find_pos(struct bufclient* buf, int target_abs_i, struct bufchunk** chunk_out, int* rel_i_out);
+enum RESULT bufclient_find_line_start(struct bufclient* buf, int target_abs_y, struct bufchunk** chunk_out, int* rel_i_out, int* start_abs_i_out);
+enum RESULT bufclient_update_cursor_coords(struct bufclient* buf);  // Update abs_x, abs_y from abs_i
+
+// Buffer Client API
+enum RESULT bufclient_init(struct bufclient* buf);
+void bufclient_free(struct bufclient* buf);
+enum RESULT bufclient_insert_char(struct bufclient* buf, char c);
+enum RESULT bufclient_delete_char(struct bufclient* buf);  // Deletes char *before* cursor
+void bufclient_move_cursor_to(struct bufclient* buf, int target_abs_i);
+void bufclient_move_cursor_relative(struct bufclient* buf, int key);  // Uses enum editorKey
+void bufclient_clear(struct bufclient* buf);
+
+// Terminal Handling
+void disableRawMode();
+enum RESULT enableRawMode();
+enum RESULT getWindowSize(int* rows, int* cols);
+enum editorKey editorReadKey();
+
+// Output / Rendering
+void screenbuf_append(const char* s, int len);
+void screenbuf_clear();
+void editorScroll();
+void editorDrawRows();
+void editorDrawStatusBar();
+void editorDrawCommandLine();
+void editorRefreshScreen();
+int calculate_visual_x(struct bufclient* buf, int target_abs_y, int target_abs_i);
+
+// File I/O
+enum RESULT editorOpen(const char* filename);
+enum RESULT editorSave();
+
+// Editor Operations
+void initEditor();
+void editorProcessCommand();
+void editorProcessKeypress();
+
+// *** Buffer Chunk Pool Implementation ***
 void bufchunk_pool_init() {
-    bufchunk_pool_free = NULL;
-    // Link all chunks in the pool into a singly-linked free list
-    for (int i = BUFCHUNK_COUNT - 1; i >= 0; i--) {
-        bufchunk_pool_data[i].prev = NULL;  // Not needed for free list links
-        bufchunk_pool_data[i].size = 0;
-        bufchunk_pool_data[i].next = bufchunk_pool_free;  // Point to the previous head
-        bufchunk_pool_free = &bufchunk_pool_data[i];      // Current chunk becomes the new head
+    int i;
+    // Link all chunks into the free list
+    for (i = 0; i < BUFCHUNK_COUNT - 1; i++) {
+        bufchunk_pool_data[i].next = &bufchunk_pool_data[i + 1];
     }
+    bufchunk_pool_data[BUFCHUNK_COUNT - 1].next = NULL;
+    bufchunk_pool_free = &bufchunk_pool_data[0];
+    bufchunk_pool_used = 0;
 }
 
-// Allocates a chunk from the free list. Returns NULL if pool is exhausted.
 struct bufchunk* bufchunk_alloc() {
-    if (!bufchunk_pool_free) {
+    if (bufchunk_pool_free == NULL) {
         return NULL;  // Pool exhausted
     }
-    // Get chunk from the head of the free list
     struct bufchunk* chunk = bufchunk_pool_free;
-    bufchunk_pool_free = chunk->next;  // Advance free list head
+    bufchunk_pool_free = chunk->next;
 
-    // Initialize the allocated chunk for use
+    // Initialize the allocated chunk
     chunk->prev = NULL;
     chunk->next = NULL;
     chunk->size = 0;
-    // Note: Existing data in chunk->data is not cleared for performance;
-    // chunk->size indicates the valid portion.
+    // chunk->data is uninitialized
+    bufchunk_pool_used++;
     return chunk;
 }
 
-// Returns a chunk to the free list.
 void bufchunk_free(struct bufchunk* chunk) {
-    if (!chunk)
+    if (chunk == NULL)
         return;
-    // Add the chunk back to the head of the free list
-    chunk->prev = NULL;  // Ensure links expected by buffer logic are cleared
+    // Add chunk back to the head of the free list
     chunk->next = bufchunk_pool_free;
-    chunk->size = 0;  // Reset size
     bufchunk_pool_free = chunk;
+    bufchunk_pool_used--;
 }
 
-// --- Buffer Client (bufclient) Management ---
+// *** Buffer Client Helper Implementation ***
 
-// Initializes a bufclient structure with a single empty chunk.
+// Find chunk and relative index for a given absolute index. (Inefficient linear scan)
+enum RESULT bufclient_find_pos(struct bufclient* buf, int target_abs_i, struct bufchunk** chunk_out, int* rel_i_out) {
+    if (target_abs_i < 0 || target_abs_i > buf->size) {
+        return RESULT_ERR;
+    }
+    // Optimization: Check if target is near current cursor? Maybe later.
+
+    // Handle edge case: position at the very end of the buffer
+    if (target_abs_i == buf->size) {
+        *chunk_out = buf->rbegin;
+        *rel_i_out = buf->rbegin ? buf->rbegin->size : 0;
+        return RESULT_OK;
+    }
+
+    struct bufchunk* current_chunk = buf->begin;
+    int current_abs_base = 0;  // Absolute index at the start of current_chunk
+    while (current_chunk != NULL) {
+        // Check if target_abs_i falls within this chunk
+        if (target_abs_i >= current_abs_base && target_abs_i < current_abs_base + current_chunk->size) {
+            *chunk_out = current_chunk;
+            *rel_i_out = target_abs_i - current_abs_base;
+            return RESULT_OK;
+        }
+        current_abs_base += current_chunk->size;
+        current_chunk = current_chunk->next;
+    }
+    // Should be unreachable if target_abs_i <= buf->size and buffer not empty
+    return RESULT_ERR;
+}
+
+// Find the chunk/offset and absolute index for the start of a given line. (Inefficient linear scan)
+enum RESULT bufclient_find_line_start(struct bufclient* buf, int target_abs_y, struct bufchunk** chunk_out, int* rel_i_out, int* start_abs_i_out) {
+    struct bufchunk* current_chunk = buf->begin;
+    int current_rel_i = 0;
+    int current_abs_i = 0;
+    int current_abs_y = 0;
+
+    // Default to start of buffer for line 0
+    *chunk_out = buf->begin;
+    *rel_i_out = 0;
+    *start_abs_i_out = 0;
+
+    if (target_abs_y == 0) {
+        return RESULT_OK;  // Line 0 starts at the beginning
+    }
+
+    while (current_chunk != NULL) {
+        while (current_rel_i < current_chunk->size) {
+            if (current_chunk->data[current_rel_i] == '\n') {
+                current_abs_y++;
+                if (current_abs_y == target_abs_y) {
+                    // Found start of target line (position after '\n')
+                    *start_abs_i_out = current_abs_i + current_rel_i + 1;
+
+                    // Determine the chunk and relative index for this start position
+                    if (current_rel_i + 1 < current_chunk->size) {
+                        *chunk_out = current_chunk;
+                        *rel_i_out = current_rel_i + 1;
+                    } else if (current_chunk->next != NULL) {
+                        // Start of line is at the beginning of the next chunk
+                        *chunk_out = current_chunk->next;
+                        *rel_i_out = 0;
+                    } else {
+                        // This newline was the very last character of the buffer
+                        *chunk_out = current_chunk;        // Still technically in this chunk
+                        *rel_i_out = current_chunk->size;  // Positioned at the end
+                    }
+                    return RESULT_OK;
+                }
+            }
+            current_rel_i++;
+        }
+        // Finished scanning this chunk, move to the next
+        current_abs_i += current_chunk->size;
+        current_chunk = current_chunk->next;
+        current_rel_i = 0;  // Reset relative index for the new chunk
+    }
+
+    // If we finished scanning and haven't found target_abs_y, it's beyond the buffer content
+    if (target_abs_y > current_abs_y) {
+        *chunk_out = buf->rbegin;  // End of buffer
+        *rel_i_out = buf->rbegin ? buf->rbegin->size : 0;
+        *start_abs_i_out = buf->size;
+        return RESULT_ERR;  // Line not found
+    }
+
+    // Should be unreachable if target_abs_y <= current_abs_y
+    return RESULT_ERR;
+}
+
+// Update cursor_abs_y and cursor_abs_x based on cursor_abs_i. (Inefficient linear scan)
+enum RESULT bufclient_update_cursor_coords(struct bufclient* buf) {
+    struct bufchunk* current_chunk = buf->begin;
+    int current_rel_i = 0;
+    int current_abs_i = 0;
+    int y = 0;
+    int x = 0;                 // Visual column
+    int line_start_abs_i = 0;  // Track start of current line for tab calculation
+
+    // Find the line containing the cursor and calculate visual X
+    while (current_chunk != NULL && current_abs_i <= buf->cursor_abs_i) {
+        while (current_rel_i < current_chunk->size && current_abs_i <= buf->cursor_abs_i) {
+            // If we reached the cursor position, we are done calculating coords
+            if (current_abs_i == buf->cursor_abs_i) {
+                buf->cursor_abs_y = y;
+                buf->cursor_abs_x = calculate_visual_x(buf, y, buf->cursor_abs_i);
+                return RESULT_OK;
+            }
+
+            if (current_chunk->data[current_rel_i] == '\n') {
+                y++;
+                line_start_abs_i = current_abs_i + 1;  // Next char starts a new line
+            }
+
+            current_rel_i++;
+            current_abs_i++;
+        }
+        // Move to next chunk if needed
+        current_chunk = current_chunk->next;
+        current_rel_i = 0;
+    }
+
+    // If cursor_abs_i == buf->size (at the very end)
+    if (buf->cursor_abs_i == buf->size) {
+        buf->cursor_abs_y = y;
+        buf->cursor_abs_x = calculate_visual_x(buf, y, buf->cursor_abs_i);
+        return RESULT_OK;
+    }
+
+    // Cursor position not found? Should not happen if cursor_abs_i is valid.
+    return RESULT_ERR;
+}
+
+// Helper to calculate visual X column for a given absolute index on a given line
+// (Inefficient: requires scan from line start)
+int calculate_visual_x(struct bufclient* buf, int target_abs_y, int target_abs_i) {
+    struct bufchunk* line_chunk;
+    int line_rel_i, line_start_abs_i;
+    int visual_x = 0;
+
+    if (bufclient_find_line_start(buf, target_abs_y, &line_chunk, &line_rel_i, &line_start_abs_i) != RESULT_OK) {
+        return 0;  // Error finding line start
+    }
+
+    struct bufchunk* current_chunk = line_chunk;
+    int current_rel_i = line_rel_i;
+    int current_abs_i = line_start_abs_i;
+
+    while (current_chunk != NULL && current_abs_i < target_abs_i) {
+        while (current_rel_i < current_chunk->size && current_abs_i < target_abs_i) {
+            char c = current_chunk->data[current_rel_i];
+            if (c == '\n') {
+                // Should not happen if target_abs_i is on target_abs_y
+                return visual_x;  // Reached end of line before target_abs_i
+            } else if (c == '\t') {
+                visual_x += (TAB_STOP - (visual_x % TAB_STOP));
+            } else if (iscntrl((unsigned char)c)) {
+                visual_x += 2;  // Assume ^X representation takes 2 columns
+            } else {
+                visual_x += 1;  // Regular printable character
+            }
+            current_rel_i++;
+            current_abs_i++;
+        }
+        current_chunk = current_chunk->next;
+        current_rel_i = 0;
+    }
+    return visual_x;
+}
+
+// *** Buffer Client API Implementation ***
 enum RESULT bufclient_init(struct bufclient* buf) {
+    memset(buf, 0, sizeof(struct bufclient));  // Zero out the structure first
     buf->begin = bufchunk_alloc();
-    if (!buf->begin)
-        return RESULT_ERR;           // Failed to get initial chunk from pool
-    buf->rbegin = buf->begin;        // Initially, first chunk is also the last
-    buf->cursor_chunk = buf->begin;  // Cursor starts in the first chunk
-    buf->cursor_index = 0;           // Cursor starts at index 0
-    buf->size = 0;                   // Buffer is initially empty
+    if (buf->begin == NULL) {
+        return RESULT_ERR;  // Out of memory
+    }
+    buf->rbegin = buf->begin;
+    buf->cursor_chunk = buf->begin;
+    buf->rowoff_chunk = buf->begin;  // Cache starts valid at beginning
+    // Other fields are initialized to 0 by memset
     return RESULT_OK;
 }
 
-// Frees all chunks associated with a bufclient, returning them to the pool.
 void bufclient_free(struct bufclient* buf) {
     struct bufchunk* current = buf->begin;
     struct bufchunk* next;
-    while (current) {
+    while (current != NULL) {
         next = current->next;
-        bufchunk_free(current);  // Return chunk to the pool
+        bufchunk_free(current);
         current = next;
     }
-    // Reset bufclient structure fields to indicate it's empty/invalid
-    buf->begin = NULL;
-    buf->rbegin = NULL;
-    buf->cursor_chunk = NULL;
-    buf->cursor_index = 0;
-    buf->size = 0;
+    // Reset bufclient structure fields
+    memset(buf, 0, sizeof(struct bufclient));
 }
 
-// Helper: Calculate the absolute byte position (0-based) of the cursor
-// within the buffer by summing sizes of preceding chunks and adding the index.
-int bufclient_get_abs_pos(struct bufclient* buf) {
-    int pos = 0;
-    struct bufchunk* current = buf->begin;
-
-    // Iterate through chunks before the cursor's chunk
-    while (current != buf->cursor_chunk && current != NULL) {
-        pos += current->size;
-        current = current->next;
-    }
-
-    // If cursor chunk was found, add the index within that chunk
-    if (current == buf->cursor_chunk) {
-        pos += buf->cursor_index;
-    }
-    // Handle cases where cursor might be invalid or buffer is empty
-    else if (buf->cursor_chunk == NULL && buf->begin != NULL && buf->size == 0) {
-        // Empty buffer with an allocated initial chunk
-        pos = 0;
-    } else if (buf->cursor_chunk == NULL && buf->begin == NULL) {
-        // Buffer truly empty (no chunks allocated)
-        pos = 0;
-    } else {
-        // Fallback: If cursor chunk is inconsistent, return end position
-        pos = buf->size;
-    }
-    return pos;
+void bufclient_clear(struct bufclient* buf) {
+    char old_filename[sizeof(buf->filename)];
+    strncpy(old_filename, buf->filename, sizeof(old_filename));
+    bufclient_free(buf);
+    bufclient_init(buf);                                          // Re-initialize to a single empty chunk
+    strncpy(buf->filename, old_filename, sizeof(buf->filename));  // Restore filename
+    buf->dirty = 1;                                               // Clearing makes it dirty unless it was already empty
 }
 
-// Helper: Set the cursor (chunk/index) based on an absolute byte position.
-enum RESULT bufclient_set_abs_pos(struct bufclient* buf, int target_pos) {
-    // Validate target position
-    if (target_pos < 0 || target_pos > buf->size)
-        return RESULT_ERR;
-
-    // Handle edge case: empty buffer
-    if (buf->size == 0 && target_pos == 0) {
-        if (!buf->begin) {  // If even the initial chunk isn't allocated (shouldn't happen after init)
-            if (bufclient_init(buf) != RESULT_OK)
-                return RESULT_ERR;  // Try re-init
-        }
-        buf->cursor_chunk = buf->begin;
-        buf->cursor_index = 0;
-        return RESULT_OK;
-    }
-
-    int current_pos = 0;
-    struct bufchunk* current = buf->begin;
-    while (current) {
-        // Check if target position falls within the current chunk's range
-        // Note: Can be *at* the end (index == size), meaning cursor is after last char
-        if (target_pos >= current_pos && target_pos <= current_pos + current->size) {
-            buf->cursor_chunk = current;
-            buf->cursor_index = target_pos - current_pos;
-            return RESULT_OK;
-        }
-        current_pos += current->size;
-
-        // Check if target is exactly at the end of the entire buffer and we are in the last chunk
-        if (current == buf->rbegin && target_pos == current_pos) {
-            buf->cursor_chunk = current;
-            buf->cursor_index = current->size;
-            return RESULT_OK;
-        }
-        current = current->next;
-    }
-    // Position not found (should not happen if target_pos <= buf->size and buffer is consistent)
-    return RESULT_ERR;
-}
-
-// Inserts a single character 'c' at the current cursor position in the buffer.
-// Handles chunk splitting if the current chunk is full.
 enum RESULT bufclient_insert_char(struct bufclient* buf, char c) {
-    struct bufchunk* chunk = buf->cursor_chunk;
-    int index = buf->cursor_index;
+    // Find the effective insertion chunk/offset (handles cursor at end of chunk)
+    struct bufchunk* insert_chunk = buf->cursor_chunk;
+    int insert_rel_i = buf->cursor_rel_i;
 
-    // Ensure cursor chunk is valid, especially for an empty buffer after init
-    if (!chunk) {
-        if (buf->size == 0 && buf->begin) {
-            chunk = buf->begin;  // Use the initial empty chunk
-            buf->cursor_chunk = chunk;
-            index = 0;
-            buf->cursor_index = 0;
+    // If cursor is exactly at the end of a non-last chunk, insertion logically happens
+    // at the start of the next chunk. This simplifies splitting logic.
+    if (insert_rel_i == insert_chunk->size && insert_chunk->next != NULL) {
+        insert_chunk = insert_chunk->next;
+        insert_rel_i = 0;
+    }
+
+    // Invalidate rowoff cache if inserting before its position
+    if (buf->rowoff_chunk && buf->cursor_abs_i < buf->rowoff_abs_i) {
+        buf->rowoff_chunk = NULL;
+    }
+
+    if (insert_chunk->size < BUFCHUNK_SIZE) {
+        // Case 1: Current chunk has space
+        if (insert_rel_i < insert_chunk->size) {  // Shift data only if inserting mid-chunk
+            memmove(insert_chunk->data + insert_rel_i + 1, insert_chunk->data + insert_rel_i, insert_chunk->size - insert_rel_i);
+        }
+        insert_chunk->data[insert_rel_i] = c;
+        insert_chunk->size++;
+
+        // Update cursor position: stays logically after the inserted char
+        buf->cursor_chunk = insert_chunk;
+        buf->cursor_rel_i = insert_rel_i + 1;
+
+    } else {
+        // Case 2: Target chunk is full, need to split/allocate new chunk *after* it
+        struct bufchunk* new_chunk = bufchunk_alloc();
+        if (new_chunk == NULL) {
+            editorSetStatusMessage("Out of memory!");
+            return RESULT_ERR;
+        }
+
+        // Link new_chunk *after* the full insert_chunk
+        new_chunk->next = insert_chunk->next;
+        new_chunk->prev = insert_chunk;
+        if (insert_chunk->next != NULL) {
+            insert_chunk->next->prev = new_chunk;
         } else {
-            return RESULT_ERR;  // Invalid buffer state
+            buf->rbegin = new_chunk;  // New chunk is now the last one
+        }
+        insert_chunk->next = new_chunk;
+
+        // Move data from insertion point onwards to new_chunk
+        int move_len = insert_chunk->size - insert_rel_i;
+        if (move_len > 0) {
+            memcpy(new_chunk->data, insert_chunk->data + insert_rel_i, move_len);
+            new_chunk->size = move_len;
+            insert_chunk->size = insert_rel_i;  // Truncate current chunk
+        } else {
+            // Inserting exactly at the end of the full chunk. Nothing to move.
+            new_chunk->size = 0;
+        }
+
+        // Insert the new character into the *original* chunk (which now has 1 byte free at the end)
+        // OR into the *new* chunk if insertion point was at the end.
+        if (insert_rel_i == BUFCHUNK_SIZE) {  // Inserted at the very end, goes into new chunk
+            new_chunk->data[0] = c;
+            new_chunk->size++;
+            // Move data originally copied to new_chunk one position over
+            memmove(new_chunk->data + 1, new_chunk->data, new_chunk->size - 1);  // size already incremented
+
+            // Cursor goes to start of new_chunk + 1
+            buf->cursor_chunk = new_chunk;
+            buf->cursor_rel_i = 1;
+
+        } else {  // Inserted mid-chunk, goes into original chunk (after split)
+            insert_chunk->data[insert_rel_i] = c;
+            insert_chunk->size++;
+            // Cursor stays in original chunk, after inserted char
+            buf->cursor_chunk = insert_chunk;
+            buf->cursor_rel_i = insert_rel_i + 1;
         }
     }
 
-    // Case 1: Current chunk has available space
-    if (chunk->size < BUFCHUNK_SIZE) {
-        // If inserting in the middle, shift existing data to the right
-        if (index < chunk->size) {
-            // memmove handles overlapping source and destination safely
-            memmove(&chunk->data[index + 1], &chunk->data[index], chunk->size - index);
-        }
-        // Place the new character and update sizes/indices
-        chunk->data[index] = c;
-        chunk->size++;
-        buf->cursor_index++;  // Move cursor forward
-        buf->size++;          // Increment total buffer size
-        return RESULT_OK;
-    }
-
-    // Case 2: Current chunk is full. Need to allocate a new chunk.
-    struct bufchunk* new_chunk = bufchunk_alloc();
-    if (!new_chunk)
-        return RESULT_ERR;  // Out of memory (chunk pool exhausted)
-
-    // Option A: Inserting exactly at the end of the full chunk (cursor_index == BUFCHUNK_SIZE)
-    // This means we append the new chunk right after the current one.
-    if (index == BUFCHUNK_SIZE) {
-        // Link the new chunk into the list after the current chunk
-        new_chunk->next = chunk->next;
-        if (chunk->next)
-            chunk->next->prev = new_chunk;  // Link back from following chunk
-        else
-            buf->rbegin = new_chunk;  // Update buffer's end pointer if inserting after last chunk
-        new_chunk->prev = chunk;
-        chunk->next = new_chunk;
-
-        // Place the character in the new chunk
-        new_chunk->data[0] = c;
-        new_chunk->size = 1;
-
-        // Move the cursor to the new chunk, positioned after the inserted character
-        buf->cursor_chunk = new_chunk;
-        buf->cursor_index = 1;
-        buf->size++;
-        return RESULT_OK;
-    }
-
-    // Option B: Inserting in the middle of the full chunk (index < BUFCHUNK_SIZE)
-    // This requires splitting the current chunk.
-    // Move the second half of data (from index onwards) from the full chunk to the new chunk.
-    int move_count = BUFCHUNK_SIZE - index;
-    memcpy(new_chunk->data, &chunk->data[index], move_count);
-    new_chunk->size = move_count;
-    chunk->size = index;  // Truncate the original chunk's size
-
-    // Link the new chunk into the list immediately after the original (now truncated) chunk
-    new_chunk->next = chunk->next;
-    if (chunk->next)
-        chunk->next->prev = new_chunk;
-    else
-        buf->rbegin = new_chunk;  // Update end pointer if splitting the last chunk
-    new_chunk->prev = chunk;
-    chunk->next = new_chunk;
-
-    // Now the original chunk has space at the end (where data was moved from).
-    // Insert the new character into the original chunk.
-    chunk->data[index] = c;
-    chunk->size++;
-    buf->cursor_index++;  // Cursor remains in the original chunk, moved one position right
     buf->size++;
+    buf->cursor_abs_i++;
+    buf->dirty = 1;
+
+    // Update abs_y, abs_x (expensive - full recalculation needed for accuracy)
+    // bufclient_update_cursor_coords(buf); // Too slow for every insert
+    // Simple update (less accurate but faster):
+    if (c == '\n') {
+        buf->cursor_abs_y++;
+        buf->cursor_abs_x = 0;
+    } else {
+        // Recalculate visual X based on the new character
+        buf->cursor_abs_x = calculate_visual_x(buf, buf->cursor_abs_y, buf->cursor_abs_i);
+    }
+    buf->cursor_goal_x = buf->cursor_abs_x;  // Update goal x on horizontal move/insert
+
     return RESULT_OK;
 }
 
-// Deletes the character immediately *before* the cursor (Backspace behavior).
-// Handles merging or removing chunks if they become empty.
-enum RESULT bufclient_delete_char(struct bufclient* buf) {
-    struct bufchunk* chunk = buf->cursor_chunk;
-    int index = buf->cursor_index;
-
-    // Cannot delete if the cursor is at the absolute beginning of the buffer
-    if (chunk == buf->begin && index == 0) {
-        return RESULT_ERR;  // Nothing to delete before the cursor
+enum RESULT bufclient_delete_char(struct bufclient* buf) {  // Deletes char *before* cursor
+    if (buf->cursor_abs_i == 0) {
+        return RESULT_OK;  // Nothing to delete at the beginning
     }
 
-    // Case 1: Deleting from within a chunk (cursor is not at the start of the chunk)
-    if (index > 0) {
-        // Shift data left to overwrite the character at index - 1
-        // memmove handles overlapping source/destination
-        memmove(&chunk->data[index - 1], &chunk->data[index], chunk->size - index);
-        chunk->size--;
-        buf->cursor_index--;  // Move cursor back one position
-        buf->size--;
+    // Find the position *before* the cursor
+    int del_abs_i = buf->cursor_abs_i - 1;
+    struct bufchunk* del_chunk;
+    int del_rel_i;
 
-        // Optional Optimization: If this chunk becomes empty *and* it's not the
-        // only chunk remaining in the buffer, remove it from the list.
-        if (chunk->size == 0 && !(chunk == buf->begin && chunk == buf->rbegin)) {
-            struct bufchunk* prev_chunk = chunk->prev;  // Should exist if not begin chunk
-            struct bufchunk* next_chunk = chunk->next;
+    if (bufclient_find_pos(buf, del_abs_i, &del_chunk, &del_rel_i) != RESULT_OK) {
+        editorSetStatusMessage("Error finding delete position!");
+        return RESULT_ERR;  // Should not happen if abs_i > 0
+    }
 
-            // Update links of neighboring chunks to bypass the empty chunk
-            if (prev_chunk)
-                prev_chunk->next = next_chunk;
-            else
-                buf->begin = next_chunk;  // Update buffer start pointer if first chunk removed
+    // Invalidate rowoff cache if deleting before its position
+    if (buf->rowoff_chunk && del_abs_i < buf->rowoff_abs_i) {
+        buf->rowoff_chunk = NULL;
+    }
 
-            if (next_chunk)
-                next_chunk->prev = prev_chunk;
-            else
-                buf->rbegin = prev_chunk;  // Update buffer end pointer if last chunk removed
+    char deleted_char = del_chunk->data[del_rel_i];
 
-            // Move cursor to the end of the previous chunk (logical position before deletion)
-            // Note: prev_chunk is guaranteed to exist here because we checked chunk != buf->begin
-            buf->cursor_chunk = prev_chunk;
-            buf->cursor_index = prev_chunk->size;
+    // Shift data within the chunk to overwrite the deleted character
+    memmove(del_chunk->data + del_rel_i, del_chunk->data + del_rel_i + 1, del_chunk->size - del_rel_i - 1);
+    del_chunk->size--;
+    buf->size--;
+    buf->dirty = 1;
 
-            bufchunk_free(chunk);  // Return the now-empty chunk to the pool
+    // Update cursor position (moves one step back logically)
+    buf->cursor_abs_i--;
+    // Find the chunk/rel_i for the *new* cursor position. It's the same as the deletion position.
+    buf->cursor_chunk = del_chunk;
+    buf->cursor_rel_i = del_rel_i;
+
+    // Recalculate abs_y, abs_x (expensive)
+    bufclient_update_cursor_coords(buf);
+    buf->cursor_goal_x = buf->cursor_abs_x;
+
+    // --- Chunk Merging ---
+    // Condition 1: Check if deleting the character emptied the chunk (and it wasn't the only chunk)
+    if (del_chunk->size == 0 && del_chunk != buf->begin) {
+        struct bufchunk* prev_chunk = del_chunk->prev;
+        struct bufchunk* next_chunk = del_chunk->next;  // Can be NULL
+
+        // Unlink the empty chunk
+        prev_chunk->next = next_chunk;
+        if (next_chunk != NULL) {
+            next_chunk->prev = prev_chunk;
+        } else {
+            buf->rbegin = prev_chunk;  // prev_chunk is now the last one
         }
-        // Further optimization (more complex): Check if adjacent chunks can now be merged
-        // if their combined size is <= BUFCHUNK_SIZE. Not implemented for simplicity.
-        return RESULT_OK;
-    }
 
-    // Case 2: Deleting at the start of a chunk (index == 0), but not the first chunk.
-    // This means deleting the boundary between the previous chunk and this one.
-    // The character logically deleted is the last character of the *previous* chunk.
-    if (index == 0 && chunk != buf->begin) {
-        struct bufchunk* prev_chunk = chunk->prev;
-
-        // Sanity check: previous chunk must exist if current is not the beginning
-        if (!prev_chunk)
-            return RESULT_ERR;  // Should not happen in a consistent list
-
-        // If previous chunk is already empty, something is wrong or delete has no effect
-        if (prev_chunk->size == 0)
-            return RESULT_ERR;  // Cannot delete last char of empty chunk
-
-        // Move cursor logically to the end of the previous chunk *before* deleting its last char
+        // Cursor must have been at the start of the (now deleted) chunk,
+        // so move it to the end of the previous chunk.
         buf->cursor_chunk = prev_chunk;
-        buf->cursor_index = prev_chunk->size;  // Cursor is now after the char to be deleted
+        buf->cursor_rel_i = prev_chunk->size;
 
-        // Perform the deletion by simply reducing the size of the previous chunk
-        prev_chunk->size--;
-        buf->size--;
+        bufchunk_free(del_chunk);  // Free the empty chunk
 
-        // Optional Optimization: If the *current* chunk ('chunk') is now empty
-        // (it might have been empty already), remove it.
-        if (chunk->size == 0) {
-            // Link previous chunk directly to the chunk after the current one
-            prev_chunk->next = chunk->next;
-            if (chunk->next)
-                chunk->next->prev = prev_chunk;
-            else
-                buf->rbegin = prev_chunk;  // Update buffer end if 'chunk' was the last one
-
-            bufchunk_free(chunk);  // Return the empty chunk to the pool
-        }
-        // Further optimization: Consider merging prev_chunk and chunk->next if space allows.
-        return RESULT_OK;
+        // After removing a chunk, try merging prev and next if possible
+        del_chunk = prev_chunk;  // Point to the chunk before the freed one for potential next merge
+        // Intentional fallthrough to check merge with next? No, handle separately.
     }
 
-    // Should not be reachable if logic is correct
-    return RESULT_ERR;
+    // Condition 2: Check if we can merge del_chunk with the *next* chunk
+    // This is useful if del_chunk is now small, OR if we deleted a newline
+    // that previously separated del_chunk and next_chunk.
+    if (del_chunk->next != NULL) {
+        struct bufchunk* next_chunk = del_chunk->next;
+        // Merge if combined size fits and either del_chunk is small or '\n' was deleted at boundary
+        int should_merge = 0;
+        if (del_chunk->size + next_chunk->size <= BUFCHUNK_SIZE) {
+            // Always merge if combined fits? Or only if one is small? Let's merge if fits.
+            should_merge = 1;
+        }
+
+        if (should_merge) {
+            // Append next_chunk's data to del_chunk
+            memcpy(del_chunk->data + del_chunk->size, next_chunk->data, next_chunk->size);
+
+            // Update size and links
+            del_chunk->size += next_chunk->size;
+            del_chunk->next = next_chunk->next;
+            if (next_chunk->next != NULL) {
+                next_chunk->next->prev = del_chunk;
+            } else {
+                buf->rbegin = del_chunk;  // del_chunk is now the last chunk
+            }
+
+            // Cursor adjustment if it was in the merged (freed) chunk is not needed
+            // because deletion happens *before* the cursor. If the cursor was in
+            // next_chunk before deletion, it would have moved back into del_chunk
+            // during the initial delete step.
+
+            bufchunk_free(next_chunk);
+        }
+    }
+
+    return RESULT_OK;
 }
 
-// --- Terminal Handling ---
+// Move cursor to a specific absolute index
+void bufclient_move_cursor_to(struct bufclient* buf, int target_abs_i) {
+    // Clamp target index within valid buffer range
+    if (target_abs_i < 0)
+        target_abs_i = 0;
+    if (target_abs_i > buf->size)
+        target_abs_i = buf->size;
 
-// Prints error message and exits cleanly.
+    // Find the chunk and relative position for the target index
+    if (bufclient_find_pos(buf, target_abs_i, &buf->cursor_chunk, &buf->cursor_rel_i) == RESULT_OK) {
+        buf->cursor_abs_i = target_abs_i;
+        // Update visual coordinates (inefficiently but accurately)
+        bufclient_update_cursor_coords(buf);
+        // Set goal x when explicitly moving cursor
+        buf->cursor_goal_x = buf->cursor_abs_x;
+    }
+    // Handle error? Maybe set cursor to nearest valid pos? For now, it might fail silently.
+}
+
+// Move cursor based on ARROW_UP, DOWN, LEFT, RIGHT keys
+void bufclient_move_cursor_relative(struct bufclient* buf, int key) {
+    int current_abs_i = buf->cursor_abs_i;
+    int target_abs_i = current_abs_i;
+    struct bufchunk* current_chunk = buf->cursor_chunk;  // Use current chunk as starting point?
+    int current_rel_i = buf->cursor_rel_i;
+
+    switch (key) {
+        case ARROW_LEFT:
+            if (target_abs_i > 0) {
+                target_abs_i--;
+                // Update chunk/rel_i efficiently if possible
+                if (current_rel_i > 0) {
+                    current_rel_i--;
+                } else if (current_chunk->prev != NULL) {
+                    current_chunk = current_chunk->prev;
+                    current_rel_i = current_chunk->size - 1;
+                } else {
+                    // At start of buffer, find_pos needed if logic fails
+                    if (bufclient_find_pos(buf, target_abs_i, &current_chunk, &current_rel_i) != RESULT_OK) {
+                        return;  // Error finding position
+                    }
+                }
+            } else {
+                return;
+            }  // Already at start
+            break;
+        case ARROW_RIGHT:
+            if (target_abs_i < buf->size) {
+                target_abs_i++;
+                // Update chunk/rel_i efficiently
+                if (current_rel_i < current_chunk->size) {
+                    current_rel_i++;
+                } else if (current_chunk->next != NULL) {
+                    current_chunk = current_chunk->next;
+                    current_rel_i = (target_abs_i == buf->size) ? current_chunk->size : 1;  // Move to first char or end
+                                                                                            // If moving right into the next chunk, rel_i should be 0 if target != size
+                    if (target_abs_i != buf->size)
+                        current_rel_i = 0;
+
+                } else {
+                    // At end of buffer, find_pos needed
+                    if (bufclient_find_pos(buf, target_abs_i, &current_chunk, &current_rel_i) != RESULT_OK) {
+                        return;  // Error finding position
+                    }
+                }
+            } else {
+                return;
+            }  // Already at end
+            break;
+        case ARROW_UP: {
+            if (buf->cursor_abs_y == 0)
+                return;  // Already on first line
+
+            // Find start of current line to know current X offset
+            struct bufchunk* line_start_chunk;
+            int line_start_rel_i, line_start_abs_i;
+            if (bufclient_find_line_start(buf, buf->cursor_abs_y, &line_start_chunk, &line_start_rel_i, &line_start_abs_i) != RESULT_OK)
+                return;
+
+            // Find start of previous line
+            struct bufchunk* prev_line_start_chunk;
+            int prev_line_start_rel_i, prev_line_start_abs_i;
+            if (bufclient_find_line_start(buf, buf->cursor_abs_y - 1, &prev_line_start_chunk, &prev_line_start_rel_i, &prev_line_start_abs_i) != RESULT_OK)
+                return;
+
+            // Iterate from start of prev line to find position matching goal_x
+            int visual_x = 0;
+            target_abs_i = prev_line_start_abs_i;  // Start searching from beginning of prev line
+            current_chunk = prev_line_start_chunk;
+            current_rel_i = prev_line_start_rel_i;
+
+            while (current_chunk != NULL) {
+                while (current_rel_i < current_chunk->size) {
+                    char c = current_chunk->data[current_rel_i];
+                    if (c == '\n') {
+                        goto end_prev_line_search;  // Reached end of line before goal_x
+                    }
+
+                    int char_width = 0;
+                    if (c == '\t') {
+                        char_width = (TAB_STOP - (visual_x % TAB_STOP));
+                    } else if (iscntrl((unsigned char)c)) {
+                        char_width = 2;
+                    } else {
+                        char_width = 1;
+                    }
+
+                    // If adding this character *exceeds* goal_x, stop *before* it
+                    if (visual_x + char_width > buf->cursor_goal_x) {
+                        goto end_prev_line_search;
+                    }
+                    visual_x += char_width;
+                    target_abs_i++;  // Advance target index
+                    current_rel_i++;
+
+                    // If we exactly hit the goal_x, stop *after* this char
+                    if (visual_x == buf->cursor_goal_x) {
+                        goto end_prev_line_search;
+                    }
+                }
+                // Move to next chunk on the line
+                current_chunk = current_chunk->next;
+                current_rel_i = 0;
+            }
+        end_prev_line_search:;
+            // Target abs_i now points to the closest position on the previous line
+        } break;
+        case ARROW_DOWN: {
+            // Find start of next line
+            struct bufchunk* next_line_start_chunk;
+            int next_line_start_rel_i, next_line_start_abs_i;
+
+            if (bufclient_find_line_start(buf, buf->cursor_abs_y + 1, &next_line_start_chunk, &next_line_start_rel_i, &next_line_start_abs_i) == RESULT_OK) {
+                // Iterate from start of next line to find goal_x position
+                int visual_x = 0;
+                target_abs_i = next_line_start_abs_i;
+                current_chunk = next_line_start_chunk;
+                current_rel_i = next_line_start_rel_i;
+
+                while (current_chunk != NULL) {
+                    while (current_rel_i < current_chunk->size) {
+                        char c = current_chunk->data[current_rel_i];
+                        if (c == '\n') {
+                            goto end_next_line_search;
+                        }
+
+                        int char_width = 0;
+                        if (c == '\t') {
+                            char_width = (TAB_STOP - (visual_x % TAB_STOP));
+                        } else if (iscntrl((unsigned char)c)) {
+                            char_width = 2;
+                        } else {
+                            char_width = 1;
+                        }
+
+                        if (visual_x + char_width > buf->cursor_goal_x) {
+                            goto end_next_line_search;
+                        }
+                        visual_x += char_width;
+                        target_abs_i++;
+                        current_rel_i++;
+                        if (visual_x == buf->cursor_goal_x) {
+                            goto end_next_line_search;
+                        }
+                    }
+                    current_chunk = current_chunk->next;
+                    current_rel_i = 0;
+                }
+            end_next_line_search:;
+
+                // Ensure target_abs_i does not exceed buffer size (can happen if last line is short)
+                if (target_abs_i > buf->size)
+                    target_abs_i = buf->size;
+
+            } else {
+                // Already on the last line (or line after last), don't move down
+                return;
+            }
+        } break;
+        default:  // Should not happen if called with arrow keys
+            return;
+    }
+
+    // Move cursor to the calculated target_abs_i using the efficient chunk/rel_i if possible
+    if (target_abs_i != buf->cursor_abs_i) {
+        buf->cursor_abs_i = target_abs_i;
+        buf->cursor_chunk = current_chunk;  // Use the efficiently tracked chunk
+        buf->cursor_rel_i = current_rel_i;  // Use the efficiently tracked rel_i
+
+        // Update visual coordinates (inefficiently but accurately)
+        bufclient_update_cursor_coords(buf);
+        // Only update goal_x on horizontal movement
+        if (key == ARROW_LEFT || key == ARROW_RIGHT) {
+            buf->cursor_goal_x = buf->cursor_abs_x;
+        }
+    }
+}
+
+// *** Terminal Handling Implementation ***
 void die(const char* s) {
-    // Attempt to clear screen and reset cursor for visibility of error
-    write(STDOUT_FILENO, "\x1b[2J", 4);  // Clear entire screen
+    // Try to clear screen and restore terminal before exiting
+    write(STDOUT_FILENO, "\x1b[2J", 4);  // Clear screen
     write(STDOUT_FILENO, "\x1b[H", 3);   // Move cursor to top-left
-
-    // Print the error message passed, plus system error if relevant
-    perror(s);  // Prints 's' followed by system error message based on errno
-
-    // Ensure terminal is restored before exiting
-    // Check if termios struct looks initialized before trying to restore
-    if (E.orig_termios.c_lflag != 0) {
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios);
-    }
-
-    exit(1);
+    disableRawMode();
+    perror(s);  // Print error message related to errno
+    _exit(1);   // Use _exit to avoid stdio flushing or atexit handlers
 }
 
-// Restores original terminal settings.
 void disableRawMode() {
-    // Only restore if original settings were successfully saved
-    if (E.orig_termios.c_lflag != 0) {  // Use c_lflag as indicator it was read
-        if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios) == -1) {
-            // Can't do much if restoration fails, maybe print warning?
-            perror("lkjsxceditor: failed to restore terminal settings");
-        }
+    // Restore original terminal settings if termios was successfully read
+    if (orig_termios.c_lflag != 0) {  // Basic check if termios was initialized
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
     }
 }
 
-// Enables raw mode for terminal input (no canonical processing, no echo).
-void enableRawMode() {
-    // Get current terminal attributes
-    if (tcgetattr(STDIN_FILENO, &E.orig_termios) == -1)
-        die("tcgetattr failed");
+enum RESULT enableRawMode() {
+    if (!isatty(STDIN_FILENO)) {  // Check if stdin is a terminal
+        errno = ENOTTY;
+        return RESULT_ERR;
+    }
+    if (tcgetattr(STDIN_FILENO, &orig_termios) == -1)
+        return RESULT_ERR;
 
-    // Create a copy to modify
-    struct termios raw = E.orig_termios;
-
-    // Disable flags for raw input:
-    // IXON: Disable Ctrl-S/Ctrl-Q software flow control
-    // ICRNL: Disable translating Carriage Return (Enter key) to Newline
-    // BRKINT, INPCK, ISTRIP: Miscellaneous flags often disabled in raw mode
+    struct termios raw = orig_termios;
+    // Input flags: disable Break signal, CR-to-NL translation, Parity check, Input stripping, SW flow control
     raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-
-    // Disable output processing flags:
-    // OPOST: Disable all output processing (e.g., translating '\n' to '\r\n')
+    // Output flags: disable all output processing
     raw.c_oflag &= ~(OPOST);
-
-    // Set character size to 8 bits per byte
+    // Control flags: set character size to 8 bits/byte
     raw.c_cflag |= (CS8);
+    // Local flags: disable Echoing, Canonical mode, Signal chars (Ctrl-C, Ctrl-Z), Extended input processing
+    raw.c_lflag &= ~(ECHO | ICANON | ISIG | IEXTEN);
+    // Control characters: Set timeout for read()
+    raw.c_cc[VMIN] = 0;   // read() returns as soon as data is available or timeout expires
+    raw.c_cc[VTIME] = 1;  // 100ms timeout
 
-    // Disable local flags:
-    // ECHO: Disable echoing typed characters back to the terminal
-    // ICANON: Disable canonical (line-buffered) mode; read byte-by-byte
-    // ISIG: Disable signal characters (Ctrl-C, Ctrl-Z)
-    // IEXTEN: Disable implementation-defined input processing (e.g., Ctrl-V)
-    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
-
-    // Set control character timeouts for non-blocking reads:
-    // VMIN = 0: read() returns immediately, even if no bytes available
-    // VTIME = 1: Timeout after 1/10th of a second (100ms) if no bytes available
-    raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 1;
-
-    // Apply the modified attributes
-    // TCSAFLUSH: Change occurs after all output written to fd has been transmitted,
-    //            and all input received but not read is discarded before the change.
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1)
-        die("tcsetattr failed on entry");
-
-    // Note: No atexit() handler used; cleanup is called explicitly before main returns.
+        return RESULT_ERR;
+    return RESULT_OK;
 }
 
-// Reads a single keypress from standard input, handling escape sequences.
-// Returns the character code or a special key code (enum editorKey).
-int editorReadKey() {
+// Get terminal window size using ioctl or fallback escape codes
+enum RESULT getWindowSize(int* rows, int* cols) {
+    struct winsize ws;
+
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
+        // Fallback: Move cursor far right/down and query position
+        if (write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12)
+            return RESULT_ERR;
+        // Send Device Status Report (DSR) query for cursor position
+        if (write(STDOUT_FILENO, "\x1b[6n", 4) != 4)
+            return RESULT_ERR;
+
+        // Read response: Esc [ rows ; cols R
+        char buf[32];
+        unsigned int i = 0;
+        // Read char by char until 'R' or buffer full/timeout
+        while (i < sizeof(buf) - 1) {
+            // Use read with timeout (set by enableRawMode)
+            if (read(STDIN_FILENO, &buf[i], 1) != 1)
+                break;
+            if (buf[i] == 'R')
+                break;
+            i++;
+        }
+        buf[i] = '\0';  // Null-terminate
+
+        // Check if response starts correctly
+        if (i < 4 || buf[0] != '\x1b' || buf[1] != '[')
+            return RESULT_ERR;
+
+        // Parse rows and columns (simple atoi replacement)
+        int r = 0, c = 0;
+        char* ptr = &buf[2];
+        char* semicolon = strchr(ptr, ';');
+        if (!semicolon || semicolon == ptr)
+            return RESULT_ERR;
+        *semicolon = '\0';  // Split string at semicolon
+
+        // Parse rows
+        while (*ptr) {
+            if (!isdigit((unsigned char)*ptr))
+                return RESULT_ERR;
+            r = r * 10 + (*ptr - '0');
+            ptr++;
+        }
+        // Parse columns
+        ptr = semicolon + 1;
+        while (*ptr && *ptr != 'R') {  // Stop at 'R'
+            if (!isdigit((unsigned char)*ptr))
+                return RESULT_ERR;
+            c = c * 10 + (*ptr - '0');
+            ptr++;
+        }
+
+        if (r == 0 || c == 0)
+            return RESULT_ERR;  // Invalid dimensions
+        *rows = r;
+        *cols = c;
+    } else {
+        // ioctl succeeded
+        *cols = ws.ws_col;
+        *rows = ws.ws_row;
+    }
+
+    if (*cols <= 0 || *rows <= 0)
+        return RESULT_ERR;
+    return RESULT_OK;
+}
+
+// Read a key, handling escape sequences for arrows, home, end etc.
+enum editorKey editorReadKey() {
     int nread;
     char c;
-    // Loop until a key is read or an error occurs (excluding EAGAIN)
+    // Loop until a key is read or an error occurs (excluding timeout)
     while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
-        // EINTR might happen if signal received, EAGAIN if timeout expires (VTIME)
-        if (nread == -1 && errno != EAGAIN && errno != EINTR)
-            die("read error");
-        // Add check for terminal resize signal here if needed
+        if (nread == -1 && errno != EAGAIN)
+            die("read");
+        // Handle signals or other non-EAGAIN errors if necessary
     }
 
-    // Check if the read character is the ESCAPE character (potential sequence start)
-    if (c == '\x1b') {
-        char seq[3];  // Buffer to read potential escape sequence parts
-
-        // Try reading the next character immediately. If timeout/fail, it was just ESC key.
+    if (c == '\x1b') {  // Potential escape sequence
+        char seq[3];
+        // Check for immediate escape key press (no following sequence)
         if (read(STDIN_FILENO, &seq[0], 1) != 1)
-            return '\x1b';
-        // Try reading the character after that. If timeout/fail, it was ESC + one char.
-        if (read(STDIN_FILENO, &seq[1], 1) != 1)
-            return '\x1b';
+            return '\x1b';  // Just ESC
 
-        // Check for common CSI (Control Sequence Introducer) sequences: ESC [ ...
+        // Check for common sequence start '[' or 'O'
         if (seq[0] == '[') {
+            if (read(STDIN_FILENO, &seq[1], 1) != 1)
+                return '\x1b';  // Incomplete sequence
+
             if (seq[1] >= '0' && seq[1] <= '9') {
-                // Sequences like ESC [ 3 ~ (Delete key)
+                // Extended sequence like Home, End, Del, PageUp/Down (e.g., Esc[3~)
                 if (read(STDIN_FILENO, &seq[2], 1) != 1)
-                    return '\x1b';  // Need final char
+                    return '\x1b';  // Incomplete
                 if (seq[2] == '~') {
                     switch (seq[1]) {
-                        // Map standard xterm escape sequences
                         case '1':
-                            return HOME_KEY;  // Often Home
+                            return HOME_KEY;  // Often ^[[1~
                         case '3':
-                            return DEL_KEY;  // Often Delete
+                            return DEL_KEY;  // Often ^[[3~
                         case '4':
-                            return END_KEY;  // Often End
+                            return END_KEY;  // Often ^[[4~
                         case '5':
                             return PAGE_UP;
                         case '6':
                             return PAGE_DOWN;
                         case '7':
-                            return HOME_KEY;  // Sometimes Home
+                            return HOME_KEY;  // Sometimes ^[[7~
                         case '8':
-                            return END_KEY;  // Sometimes End
+                            return END_KEY;  // Sometimes ^[[8~
                         default:
-                            return '\x1b';  // Unrecognized sequence number
+                            return '\x1b';  // Unrecognized number
                     }
                 } else {
-                    return '\x1b';  // Unrecognized sequence format
-                }
+                    return '\x1b';
+                }  // Malformed sequence
             } else {
-                // Sequences like ESC [ A (Arrow Up)
+                // Standard CSI sequences (e.g., arrow keys)
                 switch (seq[1]) {
                     case 'A':
-                        return ARROW_UP;
+                        return ARROW_UP;  // Esc[A
                     case 'B':
-                        return ARROW_DOWN;
+                        return ARROW_DOWN;  // Esc[B
                     case 'C':
-                        return ARROW_RIGHT;
+                        return ARROW_RIGHT;  // Esc[C
                     case 'D':
-                        return ARROW_LEFT;
+                        return ARROW_LEFT;  // Esc[D
                     case 'H':
-                        return HOME_KEY;  // Sometimes Home (vt100?)
+                        return HOME_KEY;  // Sometimes Esc[H
                     case 'F':
-                        return END_KEY;  // Sometimes End (vt100?)
+                        return END_KEY;  // Sometimes Esc[F
                     default:
-                        return '\x1b';  // Unrecognized char after '['
+                        return '\x1b';  // Unrecognized letter
                 }
             }
-        }
-        // Check for VT100/Linux console sequences: ESC O ...
-        else if (seq[0] == 'O') {
+        } else if (seq[0] == 'O') {
+            // Alternate sequences (e.g., from VT100 keypad)
+            if (read(STDIN_FILENO, &seq[1], 1) != 1)
+                return '\x1b';  // Incomplete
             switch (seq[1]) {
                 case 'H':
-                    return HOME_KEY;  // Usually Home
+                    return HOME_KEY;  // EscOH
                 case 'F':
-                    return END_KEY;  // Usually End
+                    return END_KEY;  // EscOF
+                // Arrows might be EscOA, EscOB, etc. Add if needed.
                 default:
-                    return '\x1b';  // Unrecognized char after 'O'
+                    return '\x1b';
             }
+        } else {
+            // Escape followed by something other than [ or O
+            return '\x1b';
         }
-        // If none of the recognized patterns matched, return plain ESC
-        return '\x1b';
-    } else if (c == 127) {
-        // Map the ASCII DEL character (often sent by Backspace key) to our BACKSPACE code
-        return BACKSPACE;
     } else {
-        // Regular character read
+        // Regular character (including Backspace, Enter, Tab etc.)
         return c;
     }
 }
 
-// Gets the current cursor position using ANSI escape codes (DSR).
-// Used as a fallback for getting window size. Returns -1 on failure.
-int getCursorPosition(int* rows, int* cols) {
-    char buf[32];
-    unsigned int i = 0;
+// *** Output / Rendering Implementation ***
 
-    // Send DSR (Device Status Report) - cursor position query (ESC [ 6 n)
-    if (write(STDOUT_FILENO, "\x1b[6n", 4) != 4)
-        return -1;
-
-    // Read the response from stdin: Should be ESC [ <rows> ; <cols> R
-    // Read until 'R' or buffer is full or timeout
-    while (i < sizeof(buf) - 1) {
-        if (read(STDIN_FILENO, &buf[i], 1) != 1)
-            break;  // Error or timeout
-        if (buf[i] == 'R')
-            break;  // End of response marker
-        i++;
-    }
-    buf[i] = '\0';  // Null-terminate the buffer
-
-    // Parse the response (e.g., "\x1b[24;80R")
-    // Basic validation: must start with ESC [
-    if (buf[0] != '\x1b' || buf[1] != '[')
-        return -1;
-
-    // Use sscanf for simplicity (careful with buffer overflows if not null-terminated)
-    // Or manual parsing for robustness:
-    char* ptr = &buf[2];
-    int r = 0, c = 0;
-    while (*ptr >= '0' && *ptr <= '9')
-        r = r * 10 + (*ptr++ - '0');
-    if (*ptr != ';')
-        return -1;  // Expect semicolon separator
-    ptr++;
-    while (*ptr >= '0' && *ptr <= '9')
-        c = c * 10 + (*ptr++ - '0');
-    // Optional: Check if *ptr is now 'R'
-
-    *rows = r;
-    *cols = c;
-    return 0;
-}
-
-// Gets the terminal window size (rows and columns).
-// Uses ioctl(TIOCGWINSZ) first, falls back to cursor positioning trick if ioctl fails.
-int getWindowSize(int* rows, int* cols) {
-    struct winsize ws;
-
-    // Try ioctl first - most reliable method
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
-        // Fallback: Move cursor far right (999C), then far down (999B),
-        // then query its position using DSR (Device Status Report).
-        // This works on many terminals that don't support TIOCGWINSZ.
-        if (write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12)
-            return -1;                         // Move cursor
-        return getCursorPosition(rows, cols);  // Query position
-    } else {
-        // Success using ioctl
-        *cols = ws.ws_col;
-        *rows = ws.ws_row;
-        return 0;
-    }
-}
-
-// --- Buffer Navigation (Cursor Movement Logic) ---
-
-// Helper: Find the absolute byte position of the start of the line
-// containing the given absolute position 'abs_pos'.
-// Scans backwards from 'abs_pos' looking for '\n' or buffer start.
-// Returns 0 if 'abs_pos' is on the first line.
-int find_line_start(int abs_pos) {
-    if (abs_pos <= 0)
-        return 0;  // Already at or before start
-
-    int line_start_pos = 0;  // Default to start of buffer
-    struct bufchunk* current_chunk = E.textbuf.begin;
-    int current_chunk_start_abs = 0;
-
-    // Iterate through chunks to find the one containing abs_pos or preceding it
-    while (current_chunk && current_chunk_start_abs + current_chunk->size <= abs_pos) {
-        // Scan within this chunk for the last newline before abs_pos
-        for (int i = 0; i < current_chunk->size; i++) {
-            if (current_chunk_start_abs + i >= abs_pos)
-                break;  // Don't scan past target
-            if (current_chunk->data[i] == '\n') {
-                line_start_pos = current_chunk_start_abs + i + 1;  // Start is after the newline
-            }
-        }
-        current_chunk_start_abs += current_chunk->size;
-        current_chunk = current_chunk->next;
-    }
-
-    // Scan the chunk that actually contains abs_pos
-    if (current_chunk) {
-        int end_scan_index = abs_pos - current_chunk_start_abs;
-        for (int i = 0; i < end_scan_index; i++) {
-            if (current_chunk->data[i] == '\n') {
-                line_start_pos = current_chunk_start_abs + i + 1;
-            }
-        }
-    }
-
-    // Ensure line_start doesn't exceed the original position (can happen if abs_pos is 0)
-    if (line_start_pos > abs_pos)
-        line_start_pos = abs_pos;
-    return line_start_pos;
-}
-
-// Helper: Find the absolute byte position of the end of the line
-// containing 'abs_pos'. The end is the position of the '\n' character itself,
-// or the end of the buffer if no '\n' follows.
-int find_line_end(int abs_pos) {
-    struct bufchunk* current_chunk = E.textbuf.begin;
-    int current_chunk_start_abs = 0;
-
-    // First, find the chunk containing abs_pos
-    while (current_chunk && current_chunk_start_abs + current_chunk->size <= abs_pos) {
-        current_chunk_start_abs += current_chunk->size;
-        current_chunk = current_chunk->next;
-    }
-
-    // If abs_pos is beyond buffer content (shouldn't happen if abs_pos <= E.textbuf.size)
-    if (!current_chunk)
-        return E.textbuf.size;
-
-    // Now scan from abs_pos onwards within this chunk and subsequent ones
-    int scan_start_index = abs_pos - current_chunk_start_abs;
-    while (current_chunk) {
-        for (int i = scan_start_index; i < current_chunk->size; i++) {
-            if (current_chunk->data[i] == '\n') {
-                return current_chunk_start_abs + i;  // Return position *of* the newline
-            }
-        }
-        // Continue scan in the next chunk
-        current_chunk_start_abs += current_chunk->size;
-        scan_start_index = 0;  // Start scan from index 0 of the next chunk
-        current_chunk = current_chunk->next;
-    }
-
-    // If no newline was found until the end of the buffer
-    return E.textbuf.size;
-}
-
-// Moves the logical cursor (E.textbuf.cursor_chunk/index) based on the key pressed.
-void editorMoveCursor(int key) {
-    int current_abs_pos = bufclient_get_abs_pos(&E.textbuf);
-    int target_abs_pos = current_abs_pos;  // Default to current position
-
-    // Find current line start and column for reference (used by up/down)
-    int current_line_start = find_line_start(current_abs_pos);
-    int current_col = current_abs_pos - current_line_start;
-
-    switch (key) {
-        case ARROW_LEFT:
-        case 'h':
-            if (target_abs_pos > 0) {
-                target_abs_pos--;
-            }
-            break;
-        case ARROW_RIGHT:
-        case 'l':
-            if (target_abs_pos < E.textbuf.size) {
-                target_abs_pos++;
-            }
-            break;
-        case ARROW_UP:
-        case 'k':
-            if (current_line_start > 0) {  // Can only move up if not on the first line
-                // Find start of the line *before* the current line_start
-                int prev_line_start = find_line_start(current_line_start - 1);
-                // Find the end of that previous line
-                int prev_line_end = find_line_end(prev_line_start);
-                // Try to move to the same column (current_col) on the previous line
-                target_abs_pos = prev_line_start + current_col;
-                // If the previous line was shorter, clamp cursor to the end of that line
-                if (target_abs_pos > prev_line_end) {
-                    target_abs_pos = prev_line_end;
-                }
-            }
-            // else: Already on the first line, do nothing
-            break;
-
-        case ARROW_DOWN:
-        case 'j': {
-            int current_line_end = find_line_end(current_abs_pos);
-            if (current_line_end < E.textbuf.size) {         // Can only move down if not on the last line
-                int next_line_start = current_line_end + 1;  // Start is after the '\n'
-                int next_line_end = find_line_end(next_line_start);
-                // Try to move to the same column (current_col) on the next line
-                target_abs_pos = next_line_start + current_col;
-                // If the next line is shorter, clamp cursor to the end of that line
-                if (target_abs_pos > next_line_end) {
-                    target_abs_pos = next_line_end;
-                }
-            }
-            // else: Already on the last line, do nothing
-        } break;
-
-        case PAGE_UP: {
-            // Calculate actual cursor row number (cy_actual)
-            int cy_actual = 0;
-            struct bufchunk* c = E.textbuf.begin;
-            int p = 0;
-            while (c && p < current_abs_pos) {
-                int end = (c == E.textbuf.cursor_chunk) ? E.textbuf.cursor_index : c->size;
-                for (int i = 0; i < end && p < current_abs_pos; ++i) {
-                    if (c->data[i] == '\n')
-                        cy_actual++;
-                    p++;
-                }
-                if (p == current_abs_pos)
-                    break;
-                if (c == E.textbuf.cursor_chunk && p + c->size > current_abs_pos)
-                    break;
-                c = c->next;
-            }
-
-            // Move target position up by screenrows lines, preserving column
-            E.cy = cy_actual - E.rowoff;       // Update screen cy for reference
-            target_abs_pos = current_abs_pos;  // Start from current position
-            int lines_to_move = E.screenrows;
-            while (lines_to_move-- > 0) {
-                int line_start = find_line_start(target_abs_pos);
-                if (line_start == 0) {   // Reached the first line
-                    target_abs_pos = 0;  // Go to very beginning
-                    break;
-                }
-                // Go to start of previous line for next iteration's calculation
-                target_abs_pos = find_line_start(line_start - 1);
-            }
-            // Now target_abs_pos is at the start of the target line (or buffer start)
-            // Adjust column similar to ARROW_UP logic
-            int final_line_start = target_abs_pos;
-            int final_line_end = find_line_end(final_line_start);
-            // Use the original column offset (current_col)
-            if (final_line_end >= final_line_start + current_col) {
-                target_abs_pos = final_line_start + current_col;
-            } else {
-                target_abs_pos = final_line_end;  // Clamp to end of shorter line
-            }
-
-            // Adjust rowoff so the new cursor position is near the top of the screen
-            int target_row = 0;
-            c = E.textbuf.begin;
-            p = 0;
-            while (c && p < target_abs_pos) {
-                int end = c->size;
-                for (int i = 0; i < end; ++i) {
-                    if (p == target_abs_pos)
-                        goto end_row_count_pgup;
-                    if (c->data[i] == '\n')
-                        target_row++;
-                    p++;
-                }
-                c = c->next;
-            }
-        end_row_count_pgup:;
-            E.rowoff = target_row;  // Place target line at the top
-            if (E.rowoff < 0)
-                E.rowoff = 0;
-        } break;
-        case PAGE_DOWN: {
-            // Calculate actual cursor row number (cy_actual)
-            int cy_actual = 0;
-            struct bufchunk* c = E.textbuf.begin;
-            int p = 0;
-            while (c && p < current_abs_pos) {
-                int end = (c == E.textbuf.cursor_chunk) ? E.textbuf.cursor_index : c->size;
-                for (int i = 0; i < end && p < current_abs_pos; ++i) {
-                    if (c->data[i] == '\n')
-                        cy_actual++;
-                    p++;
-                }
-                if (p == current_abs_pos)
-                    break;
-                if (c == E.textbuf.cursor_chunk && p + c->size > current_abs_pos)
-                    break;
-                c = c->next;
-            }
-
-            E.cy = cy_actual - E.rowoff;  // Update screen cy for reference
-
-            // Move target position down by screenrows lines, preserving column
-            target_abs_pos = current_abs_pos;  // Start from current position
-            int lines_to_move = E.screenrows;
-            while (lines_to_move-- > 0) {
-                int line_end = find_line_end(target_abs_pos);
-                if (line_end >= E.textbuf.size) {     // Reached the last line
-                    target_abs_pos = E.textbuf.size;  // Go to very end
-                    break;
-                }
-                // Go to start of next line for next iteration's calculation
-                target_abs_pos = line_end + 1;
-            }
-            // Now target_abs_pos is at the start of the target line (or buffer end)
-            // Adjust column similar to ARROW_DOWN logic
-            int final_line_start = (target_abs_pos == E.textbuf.size) ? find_line_start(target_abs_pos - (target_abs_pos > 0)) : find_line_start(target_abs_pos);
-            int final_line_end = find_line_end(final_line_start);
-            // Use the original column offset (current_col)
-            if (final_line_end >= final_line_start + current_col) {
-                target_abs_pos = final_line_start + current_col;
-            } else {
-                target_abs_pos = final_line_end;  // Clamp to end of shorter line
-            }
-
-            // Adjust rowoff so the new cursor position is near the bottom of the screen
-            int target_row = 0;
-            c = E.textbuf.begin;
-            p = 0;
-            while (c && p < target_abs_pos) {
-                int end = c->size;
-                for (int i = 0; i < end; ++i) {
-                    if (p == target_abs_pos)
-                        goto end_row_count_pgdn;
-                    if (c->data[i] == '\n')
-                        target_row++;
-                    p++;
-                }
-                c = c->next;
-            }
-        end_row_count_pgdn:;
-            E.rowoff = target_row - E.screenrows + 1;  // Place target line near bottom
-            if (E.rowoff < 0)
-                E.rowoff = 0;
-        } break;
-        case HOME_KEY:  // Move cursor to the beginning of the current line
-            target_abs_pos = current_line_start;
-            break;
-        case END_KEY:  // Move cursor to the end of the current line (before newline)
-            target_abs_pos = find_line_end(current_abs_pos);
-            break;
-    }
-
-    // Apply the calculated target position if it's valid and different
-    if (target_abs_pos >= 0 && target_abs_pos <= E.textbuf.size) {
-        bufclient_set_abs_pos(&E.textbuf, target_abs_pos);
-    }
-    // Note: The actual screen update (scrolling) happens in editorScroll()
-    // which is called by editorRefreshScreen().
-}
-
-// --- Screen Drawing ---
-
-// Appends a string segment to the static screen buffer.
-void screenAppend(const char* s, int len) {
-    // Check if there's enough space in the static buffer
-    if (screen_buffer_len + len >= SCREEN_BUFFER_SIZE) {
-        // Buffer full, cannot append. Skip this segment. (Minimal error handling)
-        // Could potentially flush early, but might cause flicker.
+// Append string to static screen buffer, handling overflow
+void screenbuf_append(const char* s, int len) {
+    if (len <= 0)
         return;
+    if (screenbuf_len + len > SCREEN_BUF_SIZE) {
+        // Buffer overflow! Truncate the appended string.
+        len = SCREEN_BUF_SIZE - screenbuf_len;
+        if (len <= 0)
+            return;  // No space left at all
     }
-    // Copy the string segment into the buffer
-    memcpy(&screen_buffer[screen_buffer_len], s, len);
-    screen_buffer_len += len;  // Update the length tracker
+    memcpy(screenbuf + screenbuf_len, s, len);
+    screenbuf_len += len;
 }
 
-// Writes the accumulated content of the static screen buffer to standard output
-// and resets the buffer length for the next screen refresh.
-void screenFlush() {
-    if (screen_buffer_len > 0) {
-        // Write the entire buffer in one go (reduces flicker)
-        if (write(STDOUT_FILENO, screen_buffer, screen_buffer_len) == -1) {
-            // Ignore write error (minimal error handling)
-            // A more robust editor might try to handle this.
-        }
-    }
-    screen_buffer_len = 0;  // Reset buffer for the next refresh cycle
+// Clear static screen buffer and add initial control sequences
+void screenbuf_clear() {
+    screenbuf_len = 0;
+    // Start with hiding cursor (prevents flicker during redraw)
+    screenbuf_append("\x1b[?25l", 6);
+    // Go to home position (top-left) instead of clearing whole screen
+    screenbuf_append("\x1b[H", 3);
 }
 
-// Calculates the cursor's screen coordinates (E.cx, E.cy) based on its
-// absolute position in the buffer and the current scroll offsets.
-// Also adjusts scroll offsets (E.rowoff, E.coloff) if the cursor has moved
-// outside the currently visible screen area.
-// Calculates the rendered column E.rx (handling tabs if implemented).
+// Adjust rowoff/coloff to ensure cursor is visible on screen
 void editorScroll() {
-    int current_abs_pos = bufclient_get_abs_pos(&E.textbuf);
-
-    // Calculate cursor's actual row (cy_actual, 0-based from buffer start)
-    // and rendered column (E.rx, 0-based from current line start)
-    int cy_actual = 0;
-    int current_line_start = 0;
-    E.rx = 0;  // Reset rendered X, recalculate below
-
-    struct bufchunk* chunk = E.textbuf.begin;
-    int abs_pos = 0;
-    while (chunk && abs_pos < current_abs_pos) {
-        int end_idx = chunk->size;
-        for (int i = 0; i < end_idx; ++i) {
-            if (abs_pos == current_abs_pos)
-                goto end_scroll_calc;  // Reached cursor position
-
-            if (chunk->data[i] == '\n') {
-                cy_actual++;
-                current_line_start = abs_pos + 1;  // Mark start of the next line
-            }
-            abs_pos++;
-        }
-        chunk = chunk->next;
+    // Vertical scroll check
+    if (textbuf.cursor_abs_y < textbuf.rowoff) {
+        textbuf.rowoff = textbuf.cursor_abs_y;
+        textbuf.rowoff_chunk = NULL;  // Invalidate cache when scrolling up
     }
-end_scroll_calc:;
-
-    // Calculate rx (rendered x). Simple version: no tab expansion yet.
-    E.rx = current_abs_pos - current_line_start;
-    // TODO: Add tab expansion logic to calculate E.rx accurately if needed.
-    // Need to iterate from current_line_start to current_abs_pos, counting columns
-    // and expanding tabs to the next tab stop (e.g., every 4 or 8 columns).
-
-    // --- Adjust Scroll Offsets ---
-
-    // Vertical scroll: If cursor moved above visible area, scroll up.
-    if (cy_actual < E.rowoff) {
-        E.rowoff = cy_actual;
-    }
-    // Vertical scroll: If cursor moved below visible area, scroll down.
-    if (cy_actual >= E.rowoff + E.screenrows) {
-        E.rowoff = cy_actual - E.screenrows + 1;
+    if (textbuf.cursor_abs_y >= textbuf.rowoff + screenrows) {
+        textbuf.rowoff = textbuf.cursor_abs_y - screenrows + 1;
+        textbuf.rowoff_chunk = NULL;  // Invalidate cache when scrolling down
     }
 
-    // Horizontal scroll: If cursor moved left of visible area, scroll left.
-    if (E.rx < E.coloff) {
-        E.coloff = E.rx;
+    // Horizontal scroll check (based on visual column)
+    if (textbuf.cursor_abs_x < textbuf.coloff) {
+        textbuf.coloff = textbuf.cursor_abs_x;
     }
-    // Horizontal scroll: If cursor moved right of visible area, scroll right.
-    if (E.rx >= E.coloff + E.screencols) {
-        E.coloff = E.rx - E.screencols + 1;
+    if (textbuf.cursor_abs_x >= textbuf.coloff + screencols) {
+        textbuf.coloff = textbuf.cursor_abs_x - screencols + 1;
     }
-
-    // --- Calculate Final Screen Coordinates ---
-    // E.cy is the cursor row relative to the top of the editing window (0-based)
-    E.cy = cy_actual - E.rowoff;
-    // E.cx is the cursor column relative to the left of the editing window (0-based)
-    E.cx = E.rx - E.coloff;
 }
 
-// Draws the visible text rows onto the screen buffer.
-// Handles vertical and horizontal scrolling based on E.rowoff, E.coloff.
-// Draws '~' for lines below the end of the buffer.
+// Draw the text buffer content onto the screen buffer
 void editorDrawRows() {
-    struct bufchunk* current_chunk = E.textbuf.begin;
-    int current_abs_pos = 0;
-    int current_line_num = 0;  // 0-based line number from start of buffer
+    int y;
+    struct bufchunk* current_chunk;
+    int current_rel_i;
+    int current_abs_i; // Absolute index corresponding to current_chunk/rel_i
 
-    // --- Find Starting Position for Drawing ---
-    // Find the absolute byte position corresponding to the start of the first visible row (E.rowoff)
-    if (E.rowoff > 0) {
-        while (current_chunk && current_line_num < E.rowoff) {
-            for (int i = 0; i < current_chunk->size; ++i) {
-                if (current_chunk->data[i] == '\n') {
-                    current_line_num++;
-                    if (current_line_num == E.rowoff) {
-                        current_abs_pos++;  // Start drawing *after* this newline
-                        goto found_start_row_chunk_search;
+    // Find the starting position for rendering (based on rowoff)
+    // Use cache if valid, otherwise recalculate
+    if (textbuf.rowoff_chunk == NULL) {
+        if (bufclient_find_line_start(&textbuf, textbuf.rowoff, &textbuf.rowoff_chunk, &textbuf.rowoff_rel_i, &textbuf.rowoff_abs_i) != RESULT_OK) {
+            // Error finding start row (e.g., rowoff beyond buffer end after delete?)
+            // Reset to top of buffer as fallback
+            textbuf.rowoff = 0;
+            textbuf.rowoff_chunk = textbuf.begin;
+            textbuf.rowoff_rel_i = 0;
+            textbuf.rowoff_abs_i = 0;
+            if (textbuf.begin == NULL) return; // Handle completely empty buffer case
+        }
+    }
+     // Ensure initial state is valid even if rowoff was bad
+    if (textbuf.rowoff_chunk == NULL && textbuf.begin != NULL) {
+         textbuf.rowoff_chunk = textbuf.begin;
+         textbuf.rowoff_rel_i = 0;
+         textbuf.rowoff_abs_i = 0;
+    } else if (textbuf.begin == NULL) {
+         // Nothing to draw if buffer is completely empty (no initial chunk)
+          for (y = 0; y < screenrows; y++) {
+              if (y == screenrows / 3) { // Show welcome on empty
+                 char welcome[80];
+                 int welcome_len = snprintf(welcome, sizeof(welcome), "lkjsxceditor v%s -- %d chunks free", LKJSXCEDITOR_VERSION, BUFCHUNK_COUNT - bufchunk_pool_used);
+                 if (welcome_len > screencols) welcome_len = screencols;
+                 int padding = (screencols - welcome_len) / 2;
+                 if (padding > 0) { screenbuf_append("~", 1); padding--; }
+                 while (padding-- > 0) screenbuf_append(" ", 1);
+                 screenbuf_append(welcome, welcome_len);
+              } else {
+                 screenbuf_append("~", 1);
+              }
+              screenbuf_append("\x1b[K", 3);
+              screenbuf_append("\r\n", 2);
+          }
+          return; // Nothing more to do
+    }
+
+
+    current_chunk = textbuf.rowoff_chunk;
+    current_rel_i = textbuf.rowoff_rel_i;
+    current_abs_i = textbuf.rowoff_abs_i;
+
+    // Iterate through each row of the terminal screen
+    for (y = 0; y < screenrows; y++) {
+        int file_line_abs_y = textbuf.rowoff + y; // The absolute line number we are trying to render
+
+        // Optimization: If we know we are past the end of the buffer content, draw tildes
+        if (current_chunk == NULL || (current_abs_i >= textbuf.size && textbuf.size > 0 && file_line_abs_y > textbuf.cursor_abs_y) ) {
+            // Check if we really should be past the content based on cursor pos as heuristic
+            // (This condition needs refinement, but aims to avoid unnecessary line scanning)
+             if (textbuf.size == 0 && y == screenrows / 3) { // Show welcome message near middle on empty file
+                char welcome[80];
+                int welcome_len = snprintf(welcome, sizeof(welcome), "lkjsxceditor v%s -- %d chunks free", LKJSXCEDITOR_VERSION, BUFCHUNK_COUNT - bufchunk_pool_used);
+                if (welcome_len > screencols) welcome_len = screencols;
+                int padding = (screencols - welcome_len) / 2;
+                if (padding > 0) { screenbuf_append("~", 1); padding--; }
+                while (padding-- > 0) screenbuf_append(" ", 1);
+                screenbuf_append(welcome, welcome_len);
+            } else {
+                screenbuf_append("~", 1);
+            }
+            screenbuf_append("\x1b[K", 3); // Clear rest of line
+            screenbuf_append("\r\n", 2);
+            continue; // Move to the next screen row
+        }
+
+        // Render the current file line char by char, handling horizontal scroll (coloff)
+        int line_visual_col = 0; // Visual column within the *file* line
+        int screen_x = 0;        // Current visual column position on the *screen* line
+        int line_abs_start_i = current_abs_i; // Remember start index for this line
+
+
+        struct bufchunk* line_chunk = current_chunk; // Temporary pointers for line traversal
+        int line_rel_i = current_rel_i;
+        int line_abs_i = current_abs_i;
+        int line_drawn = 0; // Flag to check if we drew anything for this line
+
+        while (line_chunk != NULL) {
+            while (line_rel_i < line_chunk->size) {
+                char c = line_chunk->data[line_rel_i];
+
+                if (c == '\n') {
+                    // End of the current file line found
+                    // Advance main pointers past the newline for the next iteration
+                    current_abs_i = line_abs_i + 1;
+                    if (line_rel_i + 1 < line_chunk->size) {
+                        current_chunk = line_chunk;
+                        current_rel_i = line_rel_i + 1;
+                    } else if (line_chunk->next != NULL) {
+                        current_chunk = line_chunk->next;
+                        current_rel_i = 0;
+                    } else {
+                        // Reached end of buffer exactly at newline
+                        current_chunk = NULL; // Signal end for outer loop
+                        current_rel_i = 0;
+                    }
+                    goto next_screen_row; // Break inner loops to move to next screen row
+                }
+
+                // Calculate width of current character and its representation
+                int char_width = 0;
+                char display_buf[TAB_STOP + 3]; // Max width is tab stop + ^ + char + null
+                int display_len = 0;
+
+                if (c == '\t') {
+                    char_width = (TAB_STOP - (line_visual_col % TAB_STOP));
+                    int i;
+                    for (i = 0; i < char_width; i++) display_buf[i] = ' ';
+                    display_len = char_width;
+                } else if (iscntrl((unsigned char)c)) {
+                    char_width = 2;
+                    display_buf[0] = '^';
+                    display_buf[1] = ((c & 0x1f) | '@'); // Map 0-31 to @, A, B...
+                    display_len = 2;
+                } else {
+                    char_width = 1;
+                    display_buf[0] = c;
+                    display_len = 1;
+                }
+                display_buf[display_len] = '\0'; // Null terminate for safety
+
+
+                // --- Horizontal Scrolling Logic ---
+                int char_end_visual_col = line_visual_col + char_width;
+
+                // Check if this character is *at least partially* visible
+                if (char_end_visual_col > textbuf.coloff) {
+                    int visible_start_col = (line_visual_col < textbuf.coloff) ? textbuf.coloff : line_visual_col;
+                    int visible_width = char_end_visual_col - visible_start_col;
+
+                    // Calculate screen position based on the visible start
+                    screen_x = visible_start_col - textbuf.coloff;
+
+                    // Truncate display string if char starts before coloff (e.g., tab)
+                    // For simplicity, we won't truncate the display string itself here,
+                    // but we will use visible_width to check screen bounds.
+                    // A more complex render could show partial tabs.
+
+                    // Check if the *visible part* fits on the remaining screen width
+                    if (screen_x < screencols) {
+                         int draw_width = (screen_x + visible_width > screencols) ? (screencols - screen_x) : visible_width;
+
+                         // Append the character (or its representation)
+                         // Simple approach: draw full representation if any part fits.
+                         if (draw_width > 0) {
+                             // If the char width > draw_width (e.g. tab cut off) draw spaces?
+                             // For now, just draw the representation up to draw_width.
+                             int append_len = (display_len < draw_width) ? display_len : draw_width;
+                             screenbuf_append(display_buf, append_len);
+                             // If append_len < draw_width, fill with spaces? No, just draw what fits.
+                             line_drawn = 1; // Mark that we drew something
+                        }
+                        // If draw_width <= 0, char starts exactly at or after screen edge.
+                    } else {
+                         // Character starts beyond the right edge of the screen. Stop rendering this line.
+                         // We need to advance the main pointers to the start of the next line
+                         // This requires finding the next newline from line_abs_i
+                          struct bufchunk* scan_chunk = line_chunk;
+                          int scan_rel_i = line_rel_i;
+                          int scan_abs_i = line_abs_i;
+                          while(scan_chunk) {
+                             while(scan_rel_i < scan_chunk->size) {
+                                  if (scan_chunk->data[scan_rel_i] == '\n') {
+                                      current_abs_i = scan_abs_i + 1;
+                                      if (scan_rel_i + 1 < scan_chunk->size) {
+                                          current_chunk = scan_chunk;
+                                          current_rel_i = scan_rel_i + 1;
+                                      } else if (scan_chunk->next) {
+                                          current_chunk = scan_chunk->next;
+                                          current_rel_i = 0;
+                                      } else {
+                                          current_chunk = NULL; current_rel_i = 0;
+                                      }
+                                      goto next_screen_row;
+                                  }
+                                  scan_rel_i++; scan_abs_i++;
+                             }
+                             scan_chunk = scan_chunk->next; scan_rel_i = 0;
+                          }
+                          // If no newline found, we reached end of buffer
+                          current_chunk = NULL; current_rel_i = 0; current_abs_i = textbuf.size;
+                          goto next_screen_row;
                     }
                 }
-                current_abs_pos++;
-            }
-            current_chunk = current_chunk->next;
-        }
-        // If rowoff is beyond the actual number of lines, current_chunk will be NULL
-    }
+                // --- End Horizontal Scrolling Logic ---
 
-found_start_row_chunk_search:;
-    // Now, find the specific chunk and index within it for current_abs_pos
-    int start_chunk_idx = 0;
-    if (E.rowoff > 0 && current_chunk) {  // Only search if we found the target line
-        struct bufchunk* search_chunk = E.textbuf.begin;
-        int search_abs_pos = 0;
-        while (search_chunk) {
-            if (current_abs_pos >= search_abs_pos && current_abs_pos < search_abs_pos + search_chunk->size) {
-                current_chunk = search_chunk;                        // Found the starting chunk
-                start_chunk_idx = current_abs_pos - search_abs_pos;  // Found the starting index
-                break;
-            }
-            search_abs_pos += search_chunk->size;
-            search_chunk = search_chunk->next;
-            // Handle case where start position is exactly at end of buffer / chunk boundary
-            if (!search_chunk && current_abs_pos == search_abs_pos) {
-                current_chunk = E.textbuf.rbegin;  // Should be last chunk
-                start_chunk_idx = current_chunk ? current_chunk->size : 0;
-                break;
-            }
-        }
-        // If search failed (e.g., current_abs_pos inconsistent), current_chunk might be wrong.
-        // The outer loop below will handle current_chunk being NULL.
-    } else if (E.rowoff == 0) {
-        // Start from the beginning of the first chunk
-        current_chunk = E.textbuf.begin;
-        start_chunk_idx = 0;
-        current_abs_pos = 0;  // Redundant but clear
-    }
-    // If E.rowoff > 0 but current_chunk is NULL, it means rowoff was too large.
+                line_visual_col += char_width; // Advance visual column on the file line
+                line_rel_i++;
+                line_abs_i++;
 
-    // --- Draw Visible Rows ---
-    for (int y = 0; y < E.screenrows; y++) {
-        int screen_col = 0;  // Current column being drawn on the screen (0 to screencols-1)
-        int file_col = 0;    // Current column relative to start of file line (for coloff)
+            } // end while current_rel_i < chunk->size
 
-        if (!current_chunk) {
-            // We are past the end of the buffer content. Draw tildes.
-            // Only draw tilde if buffer wasn't empty OR if it's not the very first line drawn.
-            if (E.textbuf.size > 0 || (y + E.rowoff) > 0) {
-                screenAppend("~", 1);
-            }
-        } else {
-            // Draw content from the current line
-            int current_chunk_idx = start_chunk_idx;
-            struct bufchunk* line_chunk = current_chunk;  // Iterate using line_chunk
+            // Move to the next chunk if needed for this line
+            line_chunk = line_chunk->next;
+            line_rel_i = 0;
 
-            while (line_chunk) {
-                int end_scan = line_chunk->size;
-                for (int i = current_chunk_idx; i < end_scan; i++) {
-                    char current_char = line_chunk->data[i];
+        } // end while line_chunk != NULL (finished buffer while drawing line)
 
-                    // Stop drawing this line if a newline is encountered
-                    if (current_char == '\n') {
-                        current_chunk = line_chunk;                    // Update main iterator chunk
-                        start_chunk_idx = i + 1;                       // Next line starts after newline
-                        if (start_chunk_idx >= current_chunk->size) {  // If newline was last char
-                            current_chunk = current_chunk->next;       // Move to next chunk
-                            start_chunk_idx = 0;                       // Start at index 0
-                        }
-                        goto next_line;  // Finished drawing this screen line
-                    }
+        // If we exit the loop because we ran out of buffer content before finding '\n'
+        current_chunk = NULL; // Signal end for outer loop
+        current_rel_i = 0;
+        current_abs_i = textbuf.size;
 
-                    // Check horizontal scroll offset (coloff)
-                    if (file_col >= E.coloff) {
-                        screen_col = file_col - E.coloff;  // Calculate visible screen column
+    next_screen_row:
+        // If we didn't draw anything (e.g., line entirely off-screen left),
+        // and file_line_abs_y corresponds to a real line, add a marker? Optional.
+        // if (!line_drawn && file_line_abs_y < total_lines) { }
 
-                        // Stop drawing if we exceed screen width
-                        if (screen_col >= E.screencols) {
-                            // Line continues off screen, update position for next line start
-                            current_chunk = line_chunk;
-                            start_chunk_idx = i;  // Next line effectively starts here for drawing
-                            // We didn't hit newline, so next draw iteration needs careful state.
-                            // Let's simplify: Assume the outer loop handles finding the *real*
-                            // start of the next line based on file content.
-                            // The `goto next_line` simplifies state management here.
-                            goto next_line;
-                        }
-
-                        // Handle control characters and tabs (simple rendering)
-                        if (iscntrl(current_char) && current_char != '\t') {
-                            screenAppend("?", 1);  // Represent control chars as '?'
-                        } else if (current_char == '\t') {
-                            // Simple tab expansion: draw spaces to next tab stop (multiple of 4)
-                            int spaces_to_add = 4 - (screen_col % 4);
-                            for (int s = 0; s < spaces_to_add; s++) {
-                                if (screen_col + s < E.screencols) {
-                                    screenAppend(" ", 1);
-                                } else
-                                    break;  // Stop if space goes past screen edge
-                            }
-                            file_col += spaces_to_add - 1;  // Adjust file_col (loop adds 1)
-                        } else {
-                            // Regular printable character
-                            screenAppend(&current_char, 1);  // Append character to screen buffer
-                        }
-                    }  // end if horizontally visible
-                    file_col++;  // Increment file column count
-                }  // end for loop within chunk
-
-                // Move to the next chunk in the buffer for this line
-                line_chunk = line_chunk->next;
-                current_chunk_idx = 0;  // Start scan from beginning of next chunk
-            }  // end while(line_chunk) for the current line
-
-            // If we exit the while loop, it means we reached the end of the buffer
-            // without finding a newline for the current screen line.
-            current_chunk = NULL;  // Signal end of buffer for subsequent rows
-            start_chunk_idx = 0;
-
-        }  // end else (if current_chunk was not NULL)
-
-    next_line:
-        screenAppend("\x1b[K", 3);  // ANSI: Clear from cursor to end of line
-        screenAppend("\r\n", 2);    // Move to the beginning of the next screen line
-
-    }  // end for y (screen rows)
+        screenbuf_append("\x1b[K", 3); // Clear rest of the screen line from cursor onwards
+        screenbuf_append("\r\n", 2);   // Move to the beginning of the next screen line
+    } // end for each screen row y
 }
 
-// Draws the status bar at the bottom of the screen.
-// Shows mode, filename, buffer size, and cursor position.
+// Draw the status bar at the bottom
 void editorDrawStatusBar() {
-    screenAppend("\x1b[7m", 4);  // ANSI: Turn on inverse video (white background, black text typical)
-    char status[80], rstatus[80];
-    int len, rlen;
+    screenbuf_append("\x1b[7m", 4);  // Invert colors (enter reverse video mode)
 
-    // --- Left side of status bar ---
-    const char* mode_str = "NORMAL";  // Determine mode string
-    if (E.mode == MODE_INSERT)
-        mode_str = "INSERT";
-    else if (E.mode == MODE_COMMAND)
-        mode_str = "COMMAND";
+    char status[128], rstatus[64];
+    int len = 0, rlen = 0;
 
-    // Format: [MODE] | [Filename|"No Name"] | [Size] [Modified indicator - TODO]
-    len = snprintf(status, sizeof(status), " %.7s | %.20s | %d bytes ",
-                   mode_str,
-                   E.filename[0] ? E.filename : "[No Name]",  // Show filename or placeholder
-                   E.textbuf.size                             // Show total buffer size in bytes
-                   // Add E.modified_flag indicator here later
-    );
-    if (len < 0)
-        len = 0;  // Safety check for snprintf error
-    if (len > E.screencols)
-        len = E.screencols;  // Truncate if too long
-
-    // --- Right side of status bar ---
-    // Calculate current line number (1-based) for display
-    int current_abs_pos = bufclient_get_abs_pos(&E.textbuf);
-    int current_line = 1;  // Start at line 1
-    struct bufchunk* chunk = E.textbuf.begin;
-    int abs_pos = 0;
-    while (chunk && abs_pos < current_abs_pos) {
-        int end_idx = chunk->size;
-        for (int i = 0; i < end_idx; ++i) {
-            if (abs_pos == current_abs_pos)
-                break;  // Stop counting when cursor position reached
-            if (chunk->data[i] == '\n') {
-                current_line++;  // Increment line count on newline
-            }
-            abs_pos++;
-        }
-        if (abs_pos == current_abs_pos)
+    // Left part: Mode, Filename, Dirty status
+    const char* mode_str;
+    switch (mode) {
+        case MODE_NORMAL:
+            mode_str = "-- NORMAL --";
             break;
-        chunk = chunk->next;
+        case MODE_INSERT:
+            mode_str = "-- INSERT --";
+            break;
+        case MODE_COMMAND:
+            mode_str = "-- COMMAND --";
+            break;  // Maybe just show ':'? No, command line below.
+        default:
+            mode_str = "";
+            break;
+    }
+    len = snprintf(status, sizeof(status), " %.15s %.40s%s",
+                   mode_str,
+                   textbuf.filename[0] ? textbuf.filename : "[No Name]",
+                   textbuf.dirty ? " [+]" : "");
+
+    // Right part: Line/TotalLines, Percentage
+    int total_lines = 1;  // Inefficiently count total lines
+    if (textbuf.size > 0) {
+        struct bufchunk* ch = textbuf.begin;
+        int i;
+        while (ch) {
+            for (i = 0; i < ch->size; ++i) {
+                if (ch->data[i] == '\n')
+                    total_lines++;
+            }
+            ch = ch->next;
+        }
+        // Handle file not ending with newline: last line isn't counted by '\n' scan
+        if (textbuf.rbegin && textbuf.rbegin->size > 0 && textbuf.rbegin->data[textbuf.rbegin->size - 1] != '\n') {
+            // This case is tricky, the last line exists but has no '\n'.
+            // Our simple '\n' count might be off by one for the total.
+            // Let's stick to the simple count for now.
+        }
+    } else {
+        total_lines = 1;  // Empty buffer is considered 1 line
     }
 
-    // Format: [Line Number]:[Rendered Column + 1]
-    rlen = snprintf(rstatus, sizeof(rstatus), " %d:%d ",
-                    current_line,
-                    E.rx + 1);  // E.rx is 0-based, display 1-based column
-    if (rlen < 0)
-        rlen = 0;  // Safety check
+    int percent = (textbuf.size > 0) ? (int)(((long long)(textbuf.cursor_abs_y + 1) * 100) / total_lines) : 100;
+    if (percent > 100)
+        percent = 100;  // Clamp if cursor_y > total_lines somehow
 
-    // --- Combine and print status bar ---
-    screenAppend(status, len);  // Print left part
+    rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d %3d%% ",
+                    textbuf.cursor_abs_y + 1, total_lines, percent);
 
-    // Fill remaining space with spaces, then print right part aligned to right edge
-    while (len < E.screencols) {
-        if (E.screencols - len == rlen) {  // If remaining space exactly fits right status
-            screenAppend(rstatus, rlen);
+    // Render left status, truncated if necessary
+    if (len > screencols)
+        len = screencols;
+    screenbuf_append(status, len);
+
+    // Render right status with padding in between
+    while (len < screencols) {
+        if (screencols - len == rlen) {  // If right status fits exactly
+            screenbuf_append(rstatus, rlen);
             len += rlen;
-            break;  // Done filling
         } else {
-            screenAppend(" ", 1);  // Add padding space
+            screenbuf_append(" ", 1);  // Add padding space
             len++;
         }
     }
 
-    screenAppend("\x1b[m", 3);  // ANSI: Turn off all attributes (including inverse video)
-    screenAppend("\r\n", 2);    // Move to the start of the next line (message bar line)
+    screenbuf_append("\x1b[m", 3);  // Reset colors (exit reverse video mode)
+    // No \r\n needed here, editorDrawCommandLine will follow
 }
 
-// Draws the message bar (second line from bottom).
-// Shows command prompt in Command mode, or status messages otherwise.
-void editorDrawMessageBar() {
-    screenAppend("\x1b[K", 3);  // ANSI: Clear the current line first
-    int msglen = 0;
+// Draw the command/status message line below the status bar
+void editorDrawCommandLine() {
+    screenbuf_append("\x1b[K", 3);  // Clear the line first
 
-    if (E.mode == MODE_COMMAND) {
-        // --- Show Command Prompt ---
-        // Construct the command prompt string: ":" followed by current cmdbuf content
-        char prompt[COMMAND_BUFFER_MAX + 2];  // Max command len + ':' + null
-        prompt[0] = ':';
-        int cmdlen = 1;  // Start after the ':'
-        struct bufchunk* chunk = E.cmdbuf.begin;
-        while (chunk && cmdlen < sizeof(prompt) - 1) {
-            int count = chunk->size;
-            if (cmdlen + count >= sizeof(prompt) - 1) {  // Prevent overflow
-                count = sizeof(prompt) - 1 - cmdlen;
-            }
-            memcpy(&prompt[cmdlen], chunk->data, count);
-            cmdlen += count;
-            chunk = chunk->next;
+    time_t current_time = time(NULL);
+    if (mode == MODE_COMMAND) {
+        // Show command prompt and current command buffer
+        statusbuf[0] = '\0';  // Clear any timed status message
+        int prompt_len = 1;   // Length of ":"
+        screenbuf_append(":", prompt_len);
+        int cmd_display_len = cmdbuf_len;
+        // Handle command longer than screen width (basic truncation)
+        if (prompt_len + cmd_display_len > screencols) {
+            cmd_display_len = screencols - prompt_len;
         }
-        prompt[cmdlen] = '\0';  // Null-terminate the assembled command string
-        msglen = cmdlen;
-        if (msglen > E.screencols)
-            msglen = E.screencols;  // Truncate if too long for screen
-        if (msglen > 0) {
-            screenAppend(prompt, msglen);  // Display the command prompt
-        }
+        screenbuf_append(cmdbuf, cmd_display_len);
+        // Cursor will be positioned after the command text later in editorRefreshScreen
+    } else if (statusbuf[0] != '\0' && current_time - statusbuf_time < 5) {
+        // Display timed status message if active
+        int msg_len = strlen(statusbuf);
+        if (msg_len > screencols)
+            msg_len = screencols;  // Truncate if needed
+        screenbuf_append(statusbuf, msg_len);
     } else {
-        // --- Show Status Message ---
-        // Display the message in E.statusmsg (potentially with timeout later)
-        msglen = strlen(E.statusmsg);
-        if (msglen > E.screencols)
-            msglen = E.screencols;  // Truncate if too long
-        // Add timeout check here if needed:
-        // if (msglen > 0 && (E.statusmsg_time == 0 || time(NULL) - E.statusmsg_time < 5)) {
-        if (msglen > 0) {
-            screenAppend(E.statusmsg, msglen);
-        }
-        // } else { E.statusmsg[0] = '\0'; } // Auto-clear message after timeout
+        // Clear status message if expired or not in command mode
+        statusbuf[0] = '\0';
     }
 }
 
-// Sets the status message displayed on the message bar. Simplified (no varargs).
-void editorSetStatusMessage(const char* msg) {
-    // Copy the message, ensuring null termination and respecting buffer size
-    strncpy(E.statusmsg, msg, sizeof(E.statusmsg) - 1);
-    E.statusmsg[sizeof(E.statusmsg) - 1] = '\0';  // Ensure null termination
-    // Optionally set timestamp for message timeout feature:
-    // E.statusmsg_time = time(NULL);
-}
-
-// Refreshes the entire screen: hides cursor, draws rows, status, message bars,
-// then positions cursor correctly and shows it again.
+// Refresh the entire screen content based on current editor state
 void editorRefreshScreen() {
-    editorScroll();  // Update scroll offsets and calculate E.cx, E.cy, E.rx
+    editorScroll();     // Ensure cursor position is valid for scrolling offsets
+    screenbuf_clear();  // Reset buffer and add initial control sequences
 
-    screenAppend("\x1b[?25l", 6);  // ANSI: Hide cursor (l = low = hide)
-    screenAppend("\x1b[H", 3);     // ANSI: Move cursor to top-left (1,1)
+    editorDrawRows();         // Draw text content
+    editorDrawStatusBar();    // Draw status bar
+    editorDrawCommandLine();  // Draw command/message line
 
-    editorDrawRows();        // Draw the text buffer content into screen buffer
-    editorDrawStatusBar();   // Draw the status bar into screen buffer
-    editorDrawMessageBar();  // Draw the message/command bar into screen buffer
+    // Calculate final cursor position on screen
+    // Screen Y = Absolute Y - Row Offset + 1 (for 1-based terminal coords)
+    int screen_cursor_y = textbuf.cursor_abs_y - textbuf.rowoff + 1;
+    // Screen X = Visual X - Col Offset + 1 (for 1-based terminal coords)
+    int screen_cursor_x = textbuf.cursor_abs_x - textbuf.coloff + 1;
 
-    // --- Position the actual terminal cursor ---
-    char buf[32];  // Buffer for formatting cursor position command
-    int term_row, term_col;
-
-    if (E.mode == MODE_COMMAND) {
-        // In command mode, cursor goes on the message bar after the typed command
-        term_row = E.screenrows + 2;  // Message bar is 2 lines below text area (1-based)
-        // Calculate current length of command in cmdbuf to find column
-        int cmd_len = 1;  // Start with 1 for the ':' prompt
-        struct bufchunk* c = E.cmdbuf.begin;
-        while (c) {
-            cmd_len += c->size;
-            c = c->next;
-        }
-        if (cmd_len > E.screencols)
-            cmd_len = E.screencols;  // Clamp to screen width
-        term_col = cmd_len + 1;      // Position cursor after the last character (1-based)
-    } else {
-        // In Normal or Insert mode, cursor goes in the text area
-        // E.cy, E.cx are 0-based relative to text area, terminal is 1-based
-        term_row = E.cy + 1;
-        term_col = E.cx + 1;
+    // Adjust cursor position if in command mode
+    if (mode == MODE_COMMAND) {
+        screen_cursor_y = screenrows + 2;      // Command line is row below status bar
+        screen_cursor_x = 1 + cmdbuf_len + 1;  // ':' + command text length + 1
     }
 
-    // Format the ANSI command to move cursor: ESC [ <row> ; <col> H
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", term_row, term_col);
-    screenAppend(buf, strlen(buf));  // Add cursor positioning command to buffer
+    // Generate cursor positioning command
+    char buf[32];
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", screen_cursor_y, screen_cursor_x);
+    screenbuf_append(buf, strlen(buf));
 
-    screenAppend("\x1b[?25h", 6);  // ANSI: Show cursor (h = high = show)
+    screenbuf_append("\x1b[?25h", 6);  // Show cursor
 
-    screenFlush();  // Write the entire accumulated screen buffer to the terminal
+    // Write the entire accumulated screen buffer to standard output in one go
+    if (write(STDOUT_FILENO, screenbuf, screenbuf_len) == -1) {
+        die("write to screen failed");  // Fatal error if writing fails
+    }
 }
 
-// --- File I/O ---
+// *** File I/O Implementation ***
 
-// Opens the specified file and loads its content into the text buffer.
-// If file doesn't exist, starts with an empty buffer.
+// Open a file and load its content into the text buffer
 enum RESULT editorOpen(const char* filename) {
-    // Store filename, ensuring null termination
-    strncpy(E.filename, filename, sizeof(E.filename) - 1);
-    E.filename[sizeof(E.filename) - 1] = '\0';
-
-    int fd = open(filename, O_RDONLY);  // Open for reading only
-    if (fd == -1) {
+    FILE* fp = fopen(filename, "r");
+    if (!fp) {
+        // File doesn't exist, treat as a new file
         if (errno == ENOENT) {
-            // File doesn't exist - this is fine, treat as a new file.
-            editorSetStatusMessage("New file created");
-            return RESULT_OK;  // Start with empty buffer (already initialized)
+            strncpy(textbuf.filename, filename, sizeof(textbuf.filename) - 1);
+            textbuf.filename[sizeof(textbuf.filename) - 1] = '\0';
+            editorSetStatusMessage("New file");
+            bufclient_clear(&textbuf);  // Ensure buffer is empty for new file
+            textbuf.dirty = 0;          // New file isn't dirty yet
+            return RESULT_OK;
         } else {
-            // Other error opening file (permissions, etc.)
-            char msg[sizeof(E.filename) + 30];  // Buffer for error message
-            snprintf(msg, sizeof(msg), "ERR: Cannot open '%s': %s", filename, strerror(errno));
-            editorSetStatusMessage(msg);
+            // Other error opening file
+            char err_msg[sizeof(textbuf.filename) + 32];
+            snprintf(err_msg, sizeof(err_msg), "Error opening: %s", strerror(errno));
+            editorSetStatusMessage(err_msg);
             return RESULT_ERR;
         }
     }
 
-    // File opened successfully, clear existing buffer content first.
-    bufclient_free(&E.textbuf);
-    if (bufclient_init(&E.textbuf) != RESULT_OK) {
-        close(fd);  // Close file descriptor even on error
-        editorSetStatusMessage("ERR: Out of memory re-initializing buffer");
-        return RESULT_ERR;
-    }
+    // File exists, store filename and clear current buffer content
+    strncpy(textbuf.filename, filename, sizeof(textbuf.filename) - 1);
+    textbuf.filename[sizeof(textbuf.filename) - 1] = '\0';
+    bufclient_clear(&textbuf);  // Clear existing buffer before loading
 
-    // Read file content into buffer chunk by chunk
-    char read_buf[BUFCHUNK_SIZE];  // Use a reasonable read buffer size
-    ssize_t nread;
-    enum RESULT res = RESULT_OK;  // Assume success initially
-    while ((nread = read(fd, read_buf, sizeof(read_buf))) > 0) {
-        for (ssize_t i = 0; i < nread; i++) {
-            // Handle line endings: Simple approach - skip '\r' (common in CRLF files)
-            if (read_buf[i] == '\r')
-                continue;
+    char readbuf[FILE_BUF_SIZE];
+    size_t nread;
+    enum RESULT res = RESULT_OK;
+    long long total_read = 0;
 
-            // Insert character into the text buffer
-            if (bufclient_insert_char(&E.textbuf, read_buf[i]) != RESULT_OK) {
-                editorSetStatusMessage("ERR: Out of buffer memory loading file");
+    // Read file in chunks and insert characters into buffer client
+    while ((nread = fread(readbuf, 1, sizeof(readbuf), fp)) > 0) {
+        size_t i;
+        total_read += nread;
+        for (i = 0; i < nread; i++) {
+            // TODO: Handle potential CR/LF conversion? For simplicity, store as is.
+            if (bufclient_insert_char(&textbuf, readbuf[i]) != RESULT_OK) {
+                editorSetStatusMessage("Error loading file: Out of memory?");
                 res = RESULT_ERR;
-                goto open_cleanup;  // Stop reading on memory error
+                goto cleanup;  // Exit loop and close file on memory error
             }
         }
     }
 
-    // Check for read errors after the loop
-    if (nread == -1) {
-        char msg[sizeof(E.filename) + 30];
-        snprintf(msg, sizeof(msg), "ERR: Read error on '%s': %s", filename, strerror(errno));
-        editorSetStatusMessage(msg);
+    // Check for read errors after loop
+    if (ferror(fp)) {
+        editorSetStatusMessage("Error reading file contents");
         res = RESULT_ERR;
     }
 
-open_cleanup:
-    close(fd);  // Close the file descriptor
-
-    // Reset cursor and scroll position after loading
-    bufclient_set_abs_pos(&E.textbuf, 0);  // Move cursor to start
-    E.rowoff = 0;
-    E.coloff = 0;
-
-    // Set success message only if no errors occurred
-    if (res == RESULT_OK && nread != -1) {
-        char msg[sizeof(E.filename) + 30];
-        snprintf(msg, sizeof(msg), "\"%s\" loaded (%d bytes)", E.filename, E.textbuf.size);
-        editorSetStatusMessage(msg);
-    }
-    // Reset modified flag here if implemented
-    // E.modified_flag = 0;
-    return res;
-}
-
-// Saves the current text buffer content to the associated filename (E.filename).
-// Creates the file if it doesn't exist, truncates if it does.
-enum RESULT editorSave() {
-    // Check if a filename is set
-    if (E.filename[0] == '\0') {
-        // Could potentially prompt for filename using command mode here.
-        // For now, require :w <filename> first if name isn't set.
-        editorSetStatusMessage("ERR: No filename. Use :w <filename>");
-        return RESULT_ERR;
-    }
-
-    // Open file for writing. O_CREAT: create if doesn't exist. O_TRUNC: clear if exists.
-    // Permissions 0644: rw-r--r-- (owner read/write, group read, others read)
-    int fd = open(E.filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd == -1) {
-        char msg[sizeof(E.filename) + 30];
-        snprintf(msg, sizeof(msg), "ERR: Cannot save '%s': %s", E.filename, strerror(errno));
-        editorSetStatusMessage(msg);
-        return RESULT_ERR;
-    }
-
-    // --- Write buffer content chunk by chunk ---
-    struct bufchunk* current = E.textbuf.begin;
-    int total_written = 0;
-    enum RESULT res = RESULT_OK;  // Assume success initially
-
-    while (current) {
-        if (current->size > 0) {  // Only write chunks that contain data
-            ssize_t written = write(fd, current->data, current->size);
-            if (written == -1) {
-                // Write error occurred
-                char msg[sizeof(E.filename) + 30];
-                snprintf(msg, sizeof(msg), "ERR: Write error on '%s': %s", E.filename, strerror(errno));
-                editorSetStatusMessage(msg);
-                res = RESULT_ERR;
-                goto save_cleanup;  // Stop writing on error
-            }
-            // Check for short write (disk full, etc.)
-            if (written != current->size) {
-                editorSetStatusMessage("ERR: Short write error, file may be incomplete!");
-                res = RESULT_ERR;
-                goto save_cleanup;
-            }
-            total_written += written;
-        }
-        current = current->next;  // Move to the next chunk
-    }
-
-    // Sanity check: total bytes written should match buffer size
-    if (res == RESULT_OK && total_written != E.textbuf.size) {
-        editorSetStatusMessage("ERR: Internal error - size mismatch after save!");
-        res = RESULT_ERR;  // Treat inconsistency as an error
-    }
-
-save_cleanup:
-    // Close the file descriptor, check for close errors too
-    if (close(fd) == -1) {
-        // Report close error only if write seemed okay, as write error is more critical
-        if (res == RESULT_OK) {
-            char msg[sizeof(E.filename) + 30];
-            snprintf(msg, sizeof(msg), "ERR: Error closing '%s': %s", E.filename, strerror(errno));
-            editorSetStatusMessage(msg);
-            res = RESULT_ERR;
-        }
-    }
-
-    // If save was successful overall, report bytes written
+cleanup:
+    fclose(fp);
     if (res == RESULT_OK) {
-        char msg[sizeof(E.filename) + 30];
-        snprintf(msg, sizeof(msg), "Wrote %d bytes to \"%s\"", total_written, E.filename);
-        editorSetStatusMessage(msg);
-        // Reset modified flag here if implemented
-        // E.modified_flag = 0;
+        textbuf.dirty = 0;                      // File just loaded is not dirty
+        bufclient_move_cursor_to(&textbuf, 0);  // Move cursor to start of file
+        char status[sizeof(textbuf.filename) + 32];
+        snprintf(status, sizeof(status), "Opened \"%s\" (%lld bytes)", textbuf.filename, total_read);
+        editorSetStatusMessage(status);
     }
     return res;
 }
 
-// --- Command Mode Processing ---
+// Save the current text buffer content to the associated filename
+enum RESULT editorSave() {
+    if (textbuf.filename[0] == '\0') {
+        // TODO: Implement prompting for filename if not set
+        editorSetStatusMessage("No filename. Use :w <filename> or specify filename on open.");
+        return RESULT_ERR;
+    }
 
-// Parses and executes the command entered in the command buffer (E.cmdbuf).
-void editorProcessCommand() {
-    // --- Extract command string from cmdbuf ---
-    char cmdline[COMMAND_BUFFER_MAX + 1];  // Local buffer for command string
-    int cmdlen = 0;
-    struct bufchunk* chunk = E.cmdbuf.begin;
-    // Iterate through chunks in cmdbuf and copy data to cmdline
-    while (chunk && cmdlen < sizeof(cmdline) - 1) {
-        int count = chunk->size;
-        // Prevent overflow of cmdline buffer
-        if (cmdlen + count >= sizeof(cmdline) - 1) {
-            count = sizeof(cmdline) - 1 - cmdlen;
+    // Open file for writing (truncates existing file or creates new)
+    FILE* fp = fopen(textbuf.filename, "w");
+    if (!fp) {
+        char err_msg[sizeof(textbuf.filename) + 32];
+        snprintf(err_msg, sizeof(err_msg), "Error saving: %s", strerror(errno));
+        editorSetStatusMessage(err_msg);
+        return RESULT_ERR;
+    }
+
+    // Iterate through buffer chunks and write data to file
+    struct bufchunk* current = textbuf.begin;
+    long long total_written = 0;
+    enum RESULT res = RESULT_OK;
+
+    while (current != NULL) {
+        if (current->size > 0) {  // Only write if chunk has data
+            if (fwrite(current->data, 1, current->size, fp) != (size_t)current->size) {
+                char err_msg[64];
+                snprintf(err_msg, sizeof(err_msg), "Write error: %s", strerror(errno));
+                editorSetStatusMessage(err_msg);
+                res = RESULT_ERR;
+                break;  // Stop writing on error
+            }
+            total_written += current->size;
         }
-        memcpy(&cmdline[cmdlen], chunk->data, count);
-        cmdlen += count;
-        chunk = chunk->next;
+        current = current->next;
     }
-    cmdline[cmdlen] = '\0';  // Ensure null termination
 
-    // --- Clear command buffer and switch mode back ---
-    bufclient_free(&E.cmdbuf);                     // Free the used command buffer chunks
-    if (bufclient_init(&E.cmdbuf) != RESULT_OK) {  // Re-initialize for next command
-        // This is unlikely to fail unless pool is exhausted in a weird state
-        editorSetStatusMessage("ERR: Critical - Failed to re-init cmdbuf!");
-        // Might need to handle this more gracefully
+    // Check for close errors? fclose can fail.
+    if (fclose(fp) != 0 && res == RESULT_OK) {
+        editorSetStatusMessage("Error closing file after write.");
+        res = RESULT_ERR;  // Consider save failed if close fails
     }
-    E.mode = MODE_NORMAL;        // Usually switch back to normal mode after command
-    editorSetStatusMessage("");  // Clear the command prompt / message bar
 
-    // --- Parse and Execute Command ---
-    if (cmdlen == 0)
-        return;  // Empty command does nothing
-
-    // Quit command
-    if (strcmp(cmdline, "q") == 0) {
-        // TODO: Add check for unsaved changes (E.modified_flag)
-        // if (E.modified_flag) {
-        //    editorSetStatusMessage("ERR: Unsaved changes! Use :q! to force quit.");
-        //    E.mode = MODE_NORMAL; // Stay in editor
-        //    return;
-        // }
-        E.quit_flag = 1;  // Signal main loop to exit
+    if (res == RESULT_OK) {
+        textbuf.dirty = 0;  // Mark buffer as clean after successful save
+        char status[sizeof(textbuf.filename) + 32];
+        snprintf(status, sizeof(status), "\"%s\" %lld bytes written", textbuf.filename, total_written);
+        editorSetStatusMessage(status);
     }
-    // Force Quit command
-    else if (strcmp(cmdline, "q!") == 0) {
-        E.quit_flag = 1;  // Signal exit regardless of changes
-    }
-    // Write command (save to current filename)
-    else if (strcmp(cmdline, "w") == 0) {
-        editorSave();
-    }
-    // Write As command: :w <filename>
-    else if (strncmp(cmdline, "w ", 2) == 0) {
-        char* new_filename = cmdline + 2;  // Point to filename after "w "
-        // Basic validation: check if filename is non-empty
-        // TODO: Trim whitespace from filename?
-        if (strlen(new_filename) > 0) {
-            // Update the editor's current filename
-            strncpy(E.filename, new_filename, sizeof(E.filename) - 1);
-            E.filename[sizeof(E.filename) - 1] = '\0';
-            editorSave();  // Save to the newly specified filename
-        } else {
-            editorSetStatusMessage("ERR: Usage: :w <filename>");
-        }
-    }
-    // Write and Quit command
-    else if (strcmp(cmdline, "wq") == 0) {
-        // Try saving first
-        if (editorSave() == RESULT_OK) {
-            E.quit_flag = 1;  // Quit only if save succeeded
-        }
-        // If save failed, error message is set by editorSave(), remain in editor
-    }
-    // Unknown command
-    else {
-        char msg[sizeof(cmdline) + 20];
-        snprintf(msg, sizeof(msg), "ERR: Unknown command: %s", cmdline);
-        editorSetStatusMessage(msg);
-    }
+    return res;
 }
 
-// --- Input Processing (Main Key Switch) ---
+// *** Editor Operations Implementation ***
 
-// Processes the key read by editorReadKey() based on the current editor mode.
+// Initialize editor state: terminal, screen size, buffers
+void initEditor() {
+    bufchunk_pool_init();  // Initialize memory pool first
+    if (bufclient_init(&textbuf) != RESULT_OK) {
+        write(STDERR_FILENO, "Failed to init text buffer\n", 27);
+        _exit(1);  // Cannot continue without buffer
+    }
+    // cmdbuf and statusbuf are static arrays, already allocated.
+    cmdbuf[0] = '\0';
+    cmdbuf_len = 0;
+    statusbuf[0] = '\0';
+    statusbuf_time = 0;
+    mode = MODE_NORMAL;
+
+    // Get terminal dimensions
+    int total_rows, total_cols;
+    if (getWindowSize(&total_rows, &total_cols) == RESULT_ERR)
+        die("getWindowSize failed");
+    screencols = total_cols;
+    // Reserve bottom 2 rows for status bar and command line
+    screenrows = total_rows - 2;
+    if (screenrows < 1) {  // Ensure at least one row for text area
+        die("Terminal too small");
+        screenrows = 1;
+    }
+
+    // Enable raw mode
+    if (enableRawMode() == RESULT_ERR)
+        die("enableRawMode failed");
+}
+
+// Set the status message displayed at the bottom
+void editorSetStatusMessage(const char* msg) {
+    if (msg == NULL) {
+        statusbuf[0] = '\0';
+        return;
+    }
+    strncpy(statusbuf, msg, STATUS_BUF_SIZE - 1);
+    statusbuf[STATUS_BUF_SIZE - 1] = '\0';  // Ensure null termination
+    statusbuf_time = time(NULL);            // Record time for timeout display
+}
+
+// Process the command entered in command mode
+void editorProcessCommand() {
+    cmdbuf[cmdbuf_len] = '\0';  // Null-terminate the received command
+
+    // Trim trailing whitespace (simple version)
+    while (cmdbuf_len > 0 && isspace((unsigned char)cmdbuf[cmdbuf_len - 1])) {
+        cmdbuf_len--;
+        cmdbuf[cmdbuf_len] = '\0';
+    }
+
+    if (cmdbuf_len == 0) {  // Empty command
+        mode = MODE_NORMAL;
+        return;
+    }
+
+    // --- Command Matching ---
+    if (strcmp(cmdbuf, "q") == 0) {
+        if (textbuf.dirty && QUIT_TIMES > 0) {  // Check dirty flag only if quit confirmation is needed
+            static int quit_confirm = 0;        // Static counter for confirmation attempts
+            quit_confirm++;
+            if (quit_confirm >= QUIT_TIMES) {
+                terminate_editor = 1;  // Confirmed quit despite dirty buffer
+            } else {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "Unsaved changes! Use :wq to save and quit, or :q! to discard (%d/%d)", quit_confirm, QUIT_TIMES);
+                editorSetStatusMessage(msg);
+                mode = MODE_NORMAL;  // Return to normal mode after failed quit attempt
+                quit_confirm = 0;    // Reset count if user does something else
+            }
+        } else {
+            terminate_editor = 1;  // Quit normally (buffer clean or no confirmation needed)
+        }
+    } else if (strcmp(cmdbuf, "q!") == 0) {
+        terminate_editor = 1;  // Force quit, discard changes
+    } else if (strcmp(cmdbuf, "w") == 0) {
+        editorSave();  // Save to current filename
+        mode = MODE_NORMAL;
+    } else if (strcmp(cmdbuf, "wq") == 0) {
+        if (editorSave() == RESULT_OK) {  // Try saving first
+            terminate_editor = 1;         // Quit if save was successful
+        } else {
+            mode = MODE_NORMAL;  // Stay in editor if save failed
+        }
+    } else if (strncmp(cmdbuf, "w ", 2) == 0) {
+        // Save As: :w <filename>
+        char* filename = cmdbuf + 2;
+        // Trim leading whitespace from filename
+        while (*filename && isspace((unsigned char)*filename))
+            filename++;
+
+        if (filename[0] != '\0') {
+            // Update buffer's filename before saving
+            strncpy(textbuf.filename, filename, sizeof(textbuf.filename) - 1);
+            textbuf.filename[sizeof(textbuf.filename) - 1] = '\0';
+            editorSave();  // Save to the new filename
+        } else {
+            editorSetStatusMessage("Filename missing for :w command");
+        }
+        mode = MODE_NORMAL;
+    } else if (strncmp(cmdbuf, "e ", 2) == 0) {
+        // Edit file: :e <filename>
+        // TODO: Check for dirty buffer first?
+        char* filename = cmdbuf + 2;
+        while (*filename && isspace((unsigned char)*filename))
+            filename++;
+        if (filename[0] != '\0') {
+            if (textbuf.dirty) {
+                editorSetStatusMessage("Unsaved changes! Save or use :e! to discard.");
+            } else {
+                editorOpen(filename);
+            }
+        } else {
+            editorSetStatusMessage("Filename missing for :e command");
+        }
+        mode = MODE_NORMAL;
+    } else if (strncmp(cmdbuf, "e! ", 3) == 0) {
+        // Edit file force: :e! <filename>
+        char* filename = cmdbuf + 3;
+        while (*filename && isspace((unsigned char)*filename))
+            filename++;
+        if (filename[0] != '\0') {
+            editorOpen(filename);  // Discard changes and open
+        } else {
+            editorSetStatusMessage("Filename missing for :e! command");
+        }
+        mode = MODE_NORMAL;
+    } else {
+        // Unknown command
+        char err_msg[CMD_BUF_SIZE + 16];
+        snprintf(err_msg, sizeof(err_msg), "Unknown command: %s", cmdbuf);
+        editorSetStatusMessage(err_msg);
+        mode = MODE_NORMAL;
+    }
+
+    // Clear command buffer for next time (unless staying in command mode)
+    // cmdbuf[0] = '\0';
+    // cmdbuf_len = 0;
+}
+
+// Process the next keypress from the user based on the current editor mode
 void editorProcessKeypress() {
-    int c = editorReadKey();  // Read the next keypress (handles escapes)
+    enum editorKey c = editorReadKey();
 
-    // Special case: handle terminal resize events if detected (e.g., SIGWINCH)
-    // TODO: Add signal handler for SIGWINCH that sets a flag, check flag here.
-    // If resized: getWindowSize(), adjust E.screenrows/cols, redraw screen.
-
-    switch (E.mode) {
-        // --- Normal Mode ---
+    // Handle mode-specific key presses
+    switch (mode) {
         case MODE_NORMAL:
             switch (c) {
-                case ':':  // Enter Command Mode
-                    E.mode = MODE_COMMAND;
-                    // Clear/init command buffer, status message set by redraw
-                    bufclient_free(&E.cmdbuf);
-                    bufclient_init(&E.cmdbuf);
-                    editorSetStatusMessage(":");  // Initial prompt (redraw shows full)
-                    break;
-
-                case 'i':  // Enter Insert Mode
-                    E.mode = MODE_INSERT;
+                // --- Mode Changes ---
+                case 'i':  // Enter Insert mode
+                    mode = MODE_INSERT;
                     editorSetStatusMessage("-- INSERT --");
                     break;
+                case ':':  // Enter Command mode
+                    mode = MODE_COMMAND;
+                    cmdbuf[0] = '\0';  // Clear previous command
+                    cmdbuf_len = 0;
+                    editorSetStatusMessage(":");  // Show initial prompt
+                    break;
 
-                // --- Movement Keys ---
+                // --- Movement ---
                 case 'h':
                 case ARROW_LEFT:
-                case 'j':
-                case ARROW_DOWN:
-                case 'k':
-                case ARROW_UP:
+                    bufclient_move_cursor_relative(&textbuf, ARROW_LEFT);
+                    break;
                 case 'l':
                 case ARROW_RIGHT:
+                    bufclient_move_cursor_relative(&textbuf, ARROW_RIGHT);
+                    break;
+                case 'k':
+                case ARROW_UP:
+                    bufclient_move_cursor_relative(&textbuf, ARROW_UP);
+                    break;
+                case 'j':
+                case ARROW_DOWN:
+                    bufclient_move_cursor_relative(&textbuf, ARROW_DOWN);
+                    break;
                 case PAGE_UP:
+                    // Move cursor up by one screen height
+                    {
+                        int i;
+                        for (i = 0; i < screenrows; i++)
+                            bufclient_move_cursor_relative(&textbuf, ARROW_UP);
+                    }
+                    // Scroll view instantly (handled by editorScroll before next draw)
+                    break;
                 case PAGE_DOWN:
-                case HOME_KEY:
-                case END_KEY:
-                    editorMoveCursor(c);
+                    // Move cursor down by one screen height
+                    {
+                        int i;
+                        for (i = 0; i < screenrows; i++)
+                            bufclient_move_cursor_relative(&textbuf, ARROW_DOWN);
+                    }
+                    // Scroll view instantly
+                    break;
+                case HOME_KEY:  // Move cursor to beginning of the current line (visual column 0)
+                {
+                    struct bufchunk* line_chunk;
+                    int line_rel_i, line_abs_i;
+                    if (bufclient_find_line_start(&textbuf, textbuf.cursor_abs_y, &line_chunk, &line_rel_i, &line_abs_i) == RESULT_OK) {
+                        bufclient_move_cursor_to(&textbuf, line_abs_i);
+                    }
+                } break;
+                case END_KEY:  // Move cursor to end of the current line
+                {
+                    struct bufchunk* next_line_chunk;
+                    int next_line_rel_i, next_line_abs_i;
+                    // Find start of *next* line
+                    if (bufclient_find_line_start(&textbuf, textbuf.cursor_abs_y + 1, &next_line_chunk, &next_line_rel_i, &next_line_abs_i) == RESULT_OK) {
+                        // Move to the character just before the newline (or start of next line)
+                        bufclient_move_cursor_to(&textbuf, next_line_abs_i - 1);
+                    } else {
+                        // We are on the last line, move cursor to the very end of the buffer
+                        bufclient_move_cursor_to(&textbuf, textbuf.size);
+                    }
+                } break;
+
+                // --- Editing ---
+                case 'x':  // Delete character under cursor (Vim 'x')
+                    // Move right, delete backward, effectively deleting char at original position
+                    if (textbuf.cursor_abs_i < textbuf.size) {
+                        bufclient_move_cursor_relative(&textbuf, ARROW_RIGHT);
+                        bufclient_delete_char(&textbuf);
+                    }
+                    break;
+                case 'd':  // Potential start of 'dd' (delete line) - Not implemented
+                    editorSetStatusMessage("dd not implemented");
+                    break;
+                case 'o':  // Insert newline below current and enter insert mode - Not implemented
+                    editorSetStatusMessage("o not implemented");
+                    break;
+                case 'O':  // Insert newline above current and enter insert mode - Not implemented
+                    editorSetStatusMessage("O not implemented");
                     break;
 
-                    // --- Deletion Keys (Basic) ---
-                    // case 'x': // Delete character under cursor
-                    //     editorMoveCursor(ARROW_RIGHT); // Move past char
-                    //     bufclient_delete_char(&E.textbuf); // Delete char before cursor
-                    //     break;
-                    // case 'd': // Start delete command (e.g., 'dd' for line delete)
-                    //     // TODO: Handle multi-key commands
-                    //     break;
-
-                case '\x1b':  // Escape key pressed while already in normal mode
-                    // Could cancel pending command (like 'd') if implemented
+                case '\x1b':  // Escape key - already in normal mode, do nothing silently
                     break;
-
-                    // Add other normal mode commands here (y, p, u, etc.)
 
                 default:
-                    // Ignore other keys in normal mode
+                    // Ignore other keys in normal mode for now
+                    // Could beep or show message?
                     break;
             }
             break;  // End MODE_NORMAL
 
-        // --- Insert Mode ---
         case MODE_INSERT:
             switch (c) {
-                case '\r':
-                case '\n':  // Enter key: Insert newline character
-                    bufclient_insert_char(&E.textbuf, '\n');
+                case '\x1b':  // Escape: Return to Normal mode
+                    mode = MODE_NORMAL;
+                    // Vim behavior: move cursor left if possible after exiting insert
+                    if (textbuf.cursor_abs_i > 0) {
+                        // Check if cursor is at the start of the line (visual X = 0)
+                        // If not at visual column 0, move left.
+                        if (textbuf.cursor_abs_x > 0) {
+                            bufclient_move_cursor_relative(&textbuf, ARROW_LEFT);
+                        }
+                    }
+                    editorSetStatusMessage("-- NORMAL --");
                     break;
-
-                case '\x1b':  // Escape key: Return to Normal Mode
-                    E.mode = MODE_NORMAL;
-                    editorSetStatusMessage("");  // Clear "-- INSERT --" message
-                    // Optional Vim behavior: move cursor left after exiting insert mode via ESC
-                    editorMoveCursor(ARROW_LEFT);
+                case '\r':  // Enter key (treat same as newline)
+                    bufclient_insert_char(&textbuf, '\n');
                     break;
-
-                case BACKSPACE:                         // Backspace key (mapped from 127 or potentially 8)
-                    bufclient_delete_char(&E.textbuf);  // Delete char before cursor
+                case BACKSPACE:  // Backspace key
+                    bufclient_delete_char(&textbuf);
                     break;
-
-                case DEL_KEY:  // Delete key (delete char *under* cursor)
-                    // Achieve this by moving right, then deleting backward
-                    editorMoveCursor(ARROW_RIGHT);
-                    if (bufclient_get_abs_pos(&E.textbuf) > 0) {  // Check if move right succeeded
-                        bufclient_delete_char(&E.textbuf);
+                case DEL_KEY:  // Delete key (delete character *after* cursor)
+                    // Move right, delete backward (if not at end of buffer)
+                    if (textbuf.cursor_abs_i < textbuf.size) {
+                        bufclient_move_cursor_relative(&textbuf, ARROW_RIGHT);
+                        bufclient_delete_char(&textbuf);
                     }
                     break;
 
-                // Allow navigation keys within insert mode
+                // Ignore movement keys in insert mode for simplicity
                 case ARROW_UP:
                 case ARROW_DOWN:
                 case ARROW_LEFT:
@@ -1686,148 +1799,88 @@ void editorProcessKeypress() {
                 case PAGE_DOWN:
                 case HOME_KEY:
                 case END_KEY:
-                    editorMoveCursor(c);
+                    // Could potentially allow movement, but complicates state.
+                    // editorSetStatusMessage("Use Esc to return to Normal mode for movement.");
                     break;
 
-                default:
-                    // Insert regular character if it's printable (or potentially UTF-8 byte)
-                    // Basic check: ASCII printable range or >= 128
-                    if ((c >= 32 && c <= 126) || c >= 128) {
-                        bufclient_insert_char(&E.textbuf, (char)c);
-                        // Set modified flag here: E.modified_flag = 1;
+                default:  // Insert regular character if printable
+                    // Check for standard printable ASCII range
+                    if (c >= 32 && c <= 126) {
+                        bufclient_insert_char(&textbuf, (char)c);
                     }
-                    // Ignore other control characters in insert mode
+                    // Ignore other non-printable chars in insert mode
                     break;
             }
             break;  // End MODE_INSERT
 
-        // --- Command Mode ---
         case MODE_COMMAND:
             switch (c) {
-                case '\r':
-                case '\n':  // Enter key: Execute the typed command
+                case '\x1b':  // Escape: Cancel command, return to Normal mode
+                    mode = MODE_NORMAL;
+                    editorSetStatusMessage("");  // Clear command line/status
+                    break;
+                case '\r':  // Enter key: Execute the command
                     editorProcessCommand();
-                    // Mode is usually reset to NORMAL within editorProcessCommand
+                    // Mode is usually set back to NORMAL by editorProcessCommand
+                    break;
+                case BACKSPACE:  // Backspace in command line
+                    if (cmdbuf_len > 0) {
+                        cmdbuf_len--;
+                        cmdbuf[cmdbuf_len] = '\0';  // Keep null-terminated
+                    }
                     break;
 
-                case '\x1b':  // Escape key: Abort command, return to Normal Mode
-                    E.mode = MODE_NORMAL;
-                    editorSetStatusMessage("");  // Clear command prompt
-                    break;
-
-                case BACKSPACE:  // Backspace key: Delete last char in command buffer
-                    bufclient_delete_char(&E.cmdbuf);
-                    // Redraw will update the message bar display
-                    break;
-
-                case DEL_KEY:  // Delete key: Not standard in command line, ignore?
-                    // Or implement forward delete if desired. Ignore for simplicity.
-                    break;
-
-                // Arrow keys in command line for history/editing? Ignore for simplicity.
+                // Ignore Del, Arrows, Page keys in command line for simplicity
+                case DEL_KEY:
                 case ARROW_UP:
                 case ARROW_DOWN:
                 case ARROW_LEFT:
                 case ARROW_RIGHT:
-                    // Could implement command history or inline editing here
+                case PAGE_UP:
+                case PAGE_DOWN:
+                case HOME_KEY:
+                case END_KEY:
                     break;
 
-                default:
-                    // Insert printable character into command buffer
-                    if (c >= 32 && c <= 126) {  // Allow basic ASCII printable
-                        // Check if command buffer has space (prevent overflow)
-                        if (E.cmdbuf.size < COMMAND_BUFFER_MAX) {
-                            bufclient_insert_char(&E.cmdbuf, (char)c);
-                            // Redraw will update the message bar display
+                default:                                  // Append typed character to command buffer if printable
+                    if (cmdbuf_len < CMD_BUF_SIZE - 1) {  // Check buffer limit
+                        if (isprint((unsigned char)c)) {  // Check if character is printable
+                            cmdbuf[cmdbuf_len++] = (char)c;
+                            cmdbuf[cmdbuf_len] = '\0';  // Keep null-terminated
                         }
                     }
-                    // Ignore control characters, high-ASCII in command line?
                     break;
             }
             break;  // End MODE_COMMAND
     }
 }
 
-// --- Initialization and Main Loop ---
-
-// Initializes the editor state, buffers, terminal settings.
-void lkjsxceditor_init() {
-    // Initialize editor state structure fields
-    E.cx = 0;
-    E.cy = 0;
-    E.rx = 0;
-    E.rowoff = 0;
-    E.coloff = 0;
-    E.filename[0] = '\0';   // No filename initially
-    E.statusmsg[0] = '\0';  // No status message initially
-    E.statusmsg_time = 0;
-    E.mode = MODE_NORMAL;  // Start in Normal mode
-    E.quit_flag = 0;       // Don't quit yet
-    // E.modified_flag = 0; // Initialize modified flag
-    // Zero out termios struct to indicate it hasn't been read yet
-    memset(&E.orig_termios, 0, sizeof(E.orig_termios));
-
-    bufchunk_pool_init();  // Initialize memory pool *before* initializing buffers
-
-    // Initialize text and command buffers using the pool
-    if (bufclient_init(&E.textbuf) != RESULT_OK) {
-        die("lkjsxceditor: Failed to initialize text buffer (out of memory?)");
-    }
-    if (bufclient_init(&E.cmdbuf) != RESULT_OK) {
-        die("lkjsxceditor: Failed to initialize command buffer (out of memory?)");
-    }
-
-    // Get initial terminal window size
-    if (getWindowSize(&E.screenrows, &E.screencols) == -1)
-        die("getWindowSize failed");
-    // Reserve bottom two rows for status bar and message bar
-    if (E.screenrows > 2) {
-        E.screenrows -= 2;
-    } else {
-        // Terminal too small to operate reasonably
-        die("lkjsxceditor: Terminal too small (needs at least 3 rows)");
-    }
-
-    enableRawMode();  // Switch terminal to raw mode
-}
-
-// Cleans up resources before exiting: restores terminal settings.
-void lkjsxceditor_cleanup() {
-    // Free buffer chunks? Not strictly required with static pool, but good practice.
-    // bufclient_free(&E.textbuf);
-    // bufclient_free(&E.cmdbuf);
-    // Chunks are returned to the static pool automatically on exit anyway.
-
-    // Clear the screen and position cursor at top-left for clean exit
-    write(STDOUT_FILENO, "\x1b[2J", 4);  // Clear screen
-    write(STDOUT_FILENO, "\x1b[H", 3);   // Move cursor home
-
-    disableRawMode();  // Restore original terminal settings
-}
-
-// --- Main Function ---
+// *** Main Function ***
 int main(int argc, char* argv[]) {
-    // Initialize editor state, terminal, buffers
-    lkjsxceditor_init();
+    // Initialization
+    initEditor();
 
-    // Open file from command line argument if provided
+    // Open file specified on command line, if any
     if (argc >= 2) {
-        if (editorOpen(argv[1]) != RESULT_OK) {
-            // Error opening file, but editor state is initialized, so continue
-            // with an empty buffer. Error message is already set.
-        }
+        editorOpen(argv[1]);
+        // editorOpen sets status messages for success/failure/new file
     } else {
-        // No file provided, show welcome/help message
-        editorSetStatusMessage("lkjsxceditor | Press :q to quit");
+        // No file specified, show welcome/help message
+        editorSetStatusMessage("lkjsxceditor | Help: :w [file] | :q | :q! | :wq | :e [file]");
     }
 
-    // Main editor loop: continues until quit_flag is set
-    while (E.quit_flag == 0) {
-        editorRefreshScreen();    // Update the display based on current state
+    // Main event loop
+    while (!terminate_editor) {
+        editorRefreshScreen();    // Update display
         editorProcessKeypress();  // Wait for and process user input
     }
 
-    // Cleanup resources (restore terminal) before exiting
-    lkjsxceditor_cleanup();
-    return 0;  // Exit successfully
+    // Cleanup before exiting
+    // Clear screen and move cursor to top-left for a clean exit
+    write(STDOUT_FILENO, "\x1b[2J", 4);
+    write(STDOUT_FILENO, "\x1b[H", 3);
+    disableRawMode();          // Restore original terminal settings
+    bufclient_free(&textbuf);  // Free buffer chunks back to pool
+
+    return 0;  // Successful exit
 }
