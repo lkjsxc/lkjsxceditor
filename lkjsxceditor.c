@@ -278,48 +278,135 @@ enum RESULT bufclient_find_line_start(struct bufclient* buf, int target_abs_y, s
     return RESULT_ERR;
 }
 
-// Update cursor_abs_y and cursor_abs_x based on cursor_abs_i. (Inefficient linear scan)
 enum RESULT bufclient_update_cursor_coords(struct bufclient* buf) {
-    struct bufchunk* current_chunk = buf->begin;
-    int current_rel_i = 0;
-    int current_abs_i = 0;
-    int y = 0;
-    int x = 0;                 // Visual column - not needed here directly
-    //int line_start_abs_i = 0;  // Track start of current line for tab calculation - handled by calculate_visual_x
+    // Target absolute index we need to find coordinates for
+    int target_abs_i = buf->cursor_abs_i;
 
-    // Find the line containing the cursor
-    while (current_chunk != NULL && current_abs_i <= buf->cursor_abs_i) {
-        while (current_rel_i < current_chunk->size && current_abs_i <= buf->cursor_abs_i) {
-            // If we reached the cursor position, we found the line number
-            if (current_abs_i == buf->cursor_abs_i) {
-                buf->cursor_abs_y = y;
-                buf->cursor_abs_x = calculate_visual_x(buf, y, buf->cursor_abs_i);
-                return RESULT_OK;
+    // Validate target index
+    if (target_abs_i < 0 || target_abs_i > buf->size) {
+        // editorSetStatusMessage("Error: Invalid cursor_abs_i %d (size %d)", target_abs_i, buf->size);
+        // Optionally try to clamp it? Or just error out.
+        // buf->cursor_abs_i = (target_abs_i < 0) ? 0 : buf->size;
+        // target_abs_i = buf->cursor_abs_i;
+        return RESULT_ERR; // Indicate error
+    }
+
+    // --- Optimization: Choose a better starting point ---
+    struct bufchunk* start_chunk = buf->begin;
+    int start_rel_i = 0;
+    int start_abs_i = 0;
+    int start_y = 0;
+    int start_x = 0; // Visual X at the start of the scan
+
+    // Check if using the rowoff cache is valid and potentially faster
+    // We use it if the cache is valid AND the target is at or after the cache point.
+    // We assume rowoff_abs_i marks the START of line rowoff.
+    if (buf->rowoff_chunk != NULL && buf->rowoff_abs_i >= 0 && buf->rowoff_abs_i <= target_abs_i)
+    {
+        // Heuristic: Only use the cache if it saves a significant amount of scanning.
+        // For simplicity, we'll use it whenever target_abs_i >= rowoff_abs_i.
+        // A more complex heuristic could compare target_abs_i - rowoff_abs_i vs rowoff_abs_i.
+        start_chunk = buf->rowoff_chunk;
+        start_rel_i = buf->rowoff_rel_i;
+        start_abs_i = buf->rowoff_abs_i;
+        start_y = buf->rowoff; // Start counting lines from rowoff
+        start_x = 0;           // Visual X is 0 at the start of any line
+    }
+
+    // --- Perform the scan from the chosen start point ---
+    struct bufchunk* current_chunk = start_chunk;
+    int current_rel_i = start_rel_i;
+    int current_abs_i = start_abs_i;
+    int current_y = start_y;
+    int current_x = start_x; // Track visual column from the start point
+
+    // Scan forward to the target_abs_i
+    while (current_chunk != NULL && current_abs_i < target_abs_i) {
+        // Process characters within the current chunk up to its size or until target found
+        int limit = current_chunk->size;
+        while (current_rel_i < limit && current_abs_i < target_abs_i) {
+            char c = current_chunk->data[current_rel_i];
+
+            if (c == '\n') {
+                current_y++;
+                current_x = 0; // Reset visual column for the new line
+            } else if (c == '\t') {
+                // Add spaces up to the next tab stop
+                current_x += TAB_STOP - (current_x % TAB_STOP);
+            } else if (c >= 0 && c < 32) {
+                 // Handle other control characters (e.g., display as ^X or ignore)
+                 // Simple approach: treat like a single character for position
+                 current_x++; // Or current_x += 2 for ^X notation? Let's stick to 1.
             }
-
-            if (current_chunk->data[current_rel_i] == '\n') {
-                y++;
-                //line_start_abs_i = current_abs_i + 1; // Not needed here
+            else {
+                // Regular printable character (assuming single byte / fixed width for now)
+                // TODO: Handle multi-byte UTF-8 characters if needed
+                current_x++;
             }
 
             current_rel_i++;
             current_abs_i++;
         }
-        // Move to next chunk if needed
-        current_chunk = current_chunk->next;
-        current_rel_i = 0;
+
+        // If we haven't reached the target yet, move to the next chunk
+        if (current_abs_i < target_abs_i) {
+             current_chunk = current_chunk->next;
+             current_rel_i = 0; // Start from the beginning of the next chunk
+        }
     }
 
-    // If cursor_abs_i == buf->size (at the very end)
-    if (buf->cursor_abs_i == buf->size) {
-        buf->cursor_abs_y = y;
-        buf->cursor_abs_x = calculate_visual_x(buf, y, buf->cursor_abs_i);
-        return RESULT_OK;
+    // --- Final Check and Update ---
+
+    // After the loop, current_abs_i should be == target_abs_i.
+    // current_y and current_x should hold the calculated coordinates.
+    if (current_abs_i != target_abs_i) {
+        // This case should ideally not happen if target_abs_i is valid and <= buf->size.
+        // It might indicate an issue with chunk linking or sizes.
+        // Maybe the target_abs_i == buf->size case wasn't handled perfectly?
+        // Let's double-check the loop condition. The loop stops *when* current_abs_i == target_abs_i.
+        // So the values calculated *up to that point* are correct for the cursor *at* target_abs_i.
+
+        // If target_abs_i == buf->size (cursor at the very end), the loop calculates
+        // the position correctly based on the characters *before* it.
+
+        // If we somehow didn't reach the target (e.g., current_chunk became NULL unexpectedly)
+        // or overshot it (logic error), fall back or report error.
+        // editorSetStatusMessage("Error: Cursor coord calculation failed internal check (abs_i %d != target %d)",
+        //                        current_abs_i, target_abs_i);
+
+        // Optional Fallback: Perform a full scan from the beginning as a safety measure
+        // (This would essentially be the original algorithm but with integrated X calculation)
+        // For now, just return error.
+        return RESULT_ERR;
     }
 
-    // Cursor position not found? Should not happen if cursor_abs_i is valid.
-    editorSetStatusMessage("Error: Cursor position calculation failed.");
-    return RESULT_ERR;
+    // Update the buffer's cursor coordinates
+    buf->cursor_abs_y = current_y;
+    buf->cursor_abs_x = current_x;
+    // buf->cursor_goal_x = current_x; // Usually set separately when moving vertically
+
+    // Optional: Update the cursor_chunk and cursor_rel_i based on final position
+    // This requires finding the chunk containing target_abs_i if we didn't track it precisely.
+    // The scan loop *ends* with current_chunk and current_rel_i pointing *at* the target position.
+    // However, if target_abs_i is exactly at the end of a chunk, current_rel_i might be == chunk->size.
+    // We need to handle the case where the cursor is *at* the start of the *next* chunk.
+    if (current_rel_i == current_chunk->size && current_chunk->next != NULL && target_abs_i < buf->size ) {
+         // Cursor is effectively at the beginning of the next chunk
+         buf->cursor_chunk = current_chunk->next;
+         buf->cursor_rel_i = 0;
+    } else {
+         // Cursor is within the current_chunk or at the very end of the buffer
+         buf->cursor_chunk = current_chunk;
+         buf->cursor_rel_i = current_rel_i;
+    }
+     // Safety check for cursor chunk if buffer is empty
+    if (buf->size == 0) {
+        buf->cursor_chunk = buf->begin; // Should be NULL or an empty chunk
+        buf->cursor_rel_i = 0;
+    }
+
+
+    return RESULT_OK;
 }
 
 // Helper to calculate visual X column for a given absolute index on a given line
@@ -514,7 +601,7 @@ enum RESULT bufclient_insert_char(struct bufclient* buf, char c) {
 
     // Update abs_y, abs_x (can be expensive, but necessary for accurate display/movement)
     // Use the full update for correctness, especially with newlines/tabs.
-    if (bufclient_update_cursor_coords(buf) != RESULT_OK) {
+    // if (bufclient_update_cursor_coords(buf) != RESULT_OK) {
          // Handle error? Maybe try simpler update as fallback?
          // Simple update (less accurate but faster):
          if (c == '\n') {
@@ -522,10 +609,10 @@ enum RESULT bufclient_insert_char(struct bufclient* buf, char c) {
              buf->cursor_abs_x = 0;
          } else {
               // This simple update is often wrong with tabs/control chars.
-              // buf->cursor_abs_x++; // Very naive
+              buf->cursor_abs_x++; // Very naive
               // Keeping the full update is safer.
          }
-    }
+    // }
 
     buf->cursor_goal_x = buf->cursor_abs_x;  // Update goal x on horizontal move/insert
 
